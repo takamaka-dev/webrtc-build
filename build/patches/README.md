@@ -223,3 +223,12 @@ WebRTC は Let's Encrypt のルート証明書を入れていないため、検�
 WebRTC は Let's Encrypt を含めていないので、Let's Encrypt の検証がうまくできないという点から本家に取り込んでもらうのは難しいと思われる。
 証明書チェーンが利用できない、という話を起点にすれば取り込んでもらえるかもしれない。
 ただし `SSL*` を渡すのは `OpenSSLCertificate` との兼ね合いを考えると筋が悪いので、本家用のパッチを書くのであれば清書する必要がある。
+
+## tkm_sframe.patch
+
+Takamaka E2EE calls (C182 / DR-055). RFC 9605 SFrame transformer (suite 5 AES_256_GCM_SHA512) next to the stock
+`FrameCryptorTransformer`, sharing nothing with it: `api/crypto/sframe_core.{h,cc}`, `api/crypto/sframe_transformer.{h,cc}`,
+the host test target `sframe_unittests`, and the Android API `org.webrtc.SFrameKeyStore` / `org.webrtc.SFrameCryptor`
+(`sdk/android/src/jni/pc/sframe_cryptor.cc`). Fail closed: no enable switch, no pass-through, no magic trailer, no default
+key. Generated with `git diff 67c45788424e3ec9df1ebc53e0269d9d5f09295b feat/C182-sframe-transformer` in the fork checkout;
+applied last, after `jni_prefix.patch` for the prefixed targets. Not yet applied to Apple targets (no ObjC binding yet).

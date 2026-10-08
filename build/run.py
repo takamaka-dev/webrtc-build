@@ -246,22 +246,28 @@ PATCHES = {
         'add_license_dav1d.patch',
         'fix_mocks.patch',
     ],
+    # C182 / DR-055 (Takamaka): tkm_sframe.patch = the RFC 9605 SFrame
+    # transformer + its Android API (SFrameKeyStore / SFrameCryptor), generated
+    # from the fork branch feat/C182-sframe-transformer. Applied last.
     'android': [
         'add_license_dav1d.patch',
         'android_webrtc_version.patch',
         'fix_mocks.patch',
+        'tkm_sframe.patch',
     ],
     'android_prefixed': [
         'add_license_dav1d.patch',
         'android_webrtc_version.patch',
         'fix_mocks.patch',
-        'jni_prefix.patch'
+        'jni_prefix.patch',
+        'tkm_sframe.patch',
     ],
     'android_prefixed_stripped': [
         'add_license_dav1d.patch',
         'android_webrtc_version.patch',
         'fix_mocks.patch',
-        'jni_prefix.patch'
+        'jni_prefix.patch',
+        'tkm_sframe.patch',
     ],
     'raspberry-pi-os_armv6': [
         'add_license_dav1d.patch',
