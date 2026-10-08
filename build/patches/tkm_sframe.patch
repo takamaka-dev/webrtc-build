@@ -1433,10 +1433,10 @@ index 0000000..8e1bdc1
 +};
 diff --git a/api/crypto/sframe_transformer.cc b/api/crypto/sframe_transformer.cc
 new file mode 100644
-index 0000000..c2899bc
+index 0000000..18b1859
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.cc
-@@ -0,0 +1,937 @@
+@@ -0,0 +1,977 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame frame transformer. See
 + * sframe_transformer.h.
@@ -1446,6 +1446,7 @@ index 0000000..c2899bc
 +
 +#include <algorithm>
 +#include <cctype>
++#include <string_view>
 +#include <utility>
 +
 +#include "api/make_ref_counted.h"
@@ -1908,6 +1909,35 @@ index 0000000..c2899bc
 +  return it == keys_.end() ? nullptr : &it->second;
 +}
 +
++void SframeKeyStore::SampleDrop(Stream* stream,
++                                SframeDropReason why,
++                                std::span<const uint8_t> data) {
++  // Receive side only, as the web worker: a sender's dropped frame is
++  // PLAINTEXT media, which must never reach stats or logs.
++  if (stream->stats.role != SframeRole::kReceiver) {
++    return;
++  }
++  std::vector<std::string>& samples = stream->stats.drop_samples;
++  const std::string name = SframeDropReasonName(why);
++  size_t same = 0;
++  for (const std::string& s : samples) {
++    if (s.compare(0, name.size() + 1, name + " ") == 0) {
++      ++same;
++    }
++  }
++  if (same >= 3 || samples.size() >= 12) {
++    return;
++  }
++  static constexpr std::string_view kHex = "0123456789abcdef";
++  std::string hex;
++  for (uint8_t b : data.first(std::min<size_t>(12, data.size()))) {
++    hex += kHex[b >> 4];
++    hex += kHex[b & 15];
++  }
++  samples.push_back(name + " len=" + std::to_string(data.size()) +
++                    " first=" + hex);
++}
++
 +void SframeKeyStore::DropLocked(Stream* stream,
 +                                SframeDropReason why,
 +                                Events* events) {
@@ -1975,6 +2005,7 @@ index 0000000..c2899bc
 +          : TransformableFrameInterface::Direction::kReceiver;
 +  if (frame.GetDirection() != expected) {
 +    DropLocked(stream, SframeDropReason::kInternal, events);
++    SampleDrop(stream, SframeDropReason::kInternal, data);
 +    return false;
 +  }
 +  SframeDropReason why = SframeDropReason::kInternal;
@@ -1985,6 +2016,7 @@ index 0000000..c2899bc
 +  if (!ok) {
 +    out->clear();
 +    DropLocked(stream, why, events);
++    SampleDrop(stream, why, data);
 +    return false;
 +  }
 +  st.passed++;
@@ -2145,6 +2177,14 @@ index 0000000..c2899bc
 +                                SframeDropReason* why,
 +                                uint64_t* kid_out) {
 +  const std::span<const uint8_t> data = frame.GetData();
++  if (data.empty()) {
++    // Padding-only RTP packets (bandwidth probing) reach the audio receive
++    // transform as zero-length frames (audio/channel_receive.cc subtracts the
++    // padding). No media, not a decryption failure: dropped as 'empty', not
++    // counted toward the storm (M2 finding F-M2-1).
++    *why = SframeDropReason::kEmpty;
++    return false;
++  }
 +  if (data.size() < kPrefix + 1 + sframe::kTagSize) {
 +    *why = SframeDropReason::kShort;
 +    return false;
@@ -2376,10 +2416,10 @@ index 0000000..c2899bc
 +}  // namespace webrtc
 diff --git a/api/crypto/sframe_transformer.h b/api/crypto/sframe_transformer.h
 new file mode 100644
-index 0000000..6ceee5c
+index 0000000..e50adbb
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.h
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,330 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame (RFC 9605) frame transformer
 + * of the native engine.
@@ -2480,6 +2520,11 @@ index 0000000..6ceee5c
 +  std::optional<Timestamp> first_frame_at;
 +  std::optional<Timestamp> first_pass_at;
 +  std::optional<Timestamp> last_frame_at;
++  // Receive side only. Diagnostics, as the web worker's dropSamples: the first
++  // drops of each reason as "reason len=N first=<hex of the first 12 bytes>"
++  // (at most 3 per reason, 12 in all). Clear prefix / header / ciphertext only,
++  // never a key.
++  std::vector<std::string> drop_samples;
 +  uint64_t dropped_total() const;
 +};
 +
@@ -2628,6 +2673,9 @@ index 0000000..6ceee5c
 +  void DropLocked(Stream* stream, SframeDropReason why, Events* events)
 +      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 +  void RecordNoSink(Stream* stream, size_t bytes, Events* events);
++  static void SampleDrop(Stream* stream,
++                         SframeDropReason why,
++                         std::span<const uint8_t> data);
 +  void PurgeExpiredLocked(Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 +  KeyEntry* FindKeyLocked(uint64_t kid) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 +  void Dispatch(const Events& events);
@@ -2704,10 +2752,10 @@ index 0000000..6ceee5c
 +#endif  // API_CRYPTO_SFRAME_TRANSFORMER_H_
 diff --git a/api/crypto/sframe_transformer_unittest.cc b/api/crypto/sframe_transformer_unittest.cc
 new file mode 100644
-index 0000000..bf46a42
+index 0000000..93eadda
 --- /dev/null
 +++ b/api/crypto/sframe_transformer_unittest.cc
-@@ -0,0 +1,867 @@
+@@ -0,0 +1,874 @@
 +/*
 + * C182 / DR-055 — the SFrame transformer: our vectors through the
 + * FrameTransformerInterface, the fail-closed negative controls (CM-1, CM-2,
@@ -2962,6 +3010,8 @@ index 0000000..bf46a42
 +  EXPECT_TRUE(alice.sinks["a"]->frames.empty());
 +  EXPECT_TRUE(alice.sinks["v"]->frames.empty());
 +  EXPECT_EQ(Dropped(audio->GetStats(), SframeDropReason::kNoKey), 3u);
++  // A sender's dropped frames are plaintext: never sampled into the stats.
++  EXPECT_TRUE(audio->GetStats().drop_samples.empty());
 +  EXPECT_EQ(Dropped(video->GetStats(), SframeDropReason::kNoKey), 1u);
 +  // Removing the send key closes the sender again.
 +  ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
@@ -3013,6 +3063,8 @@ index 0000000..bf46a42
 +
 +  rv->Transform(VideoFrame(unit, Direction::kReceiver));  // no key at all
 +  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 1u);
++  ASSERT_EQ(rv->GetStats().drop_samples.size(), 1u);
++  EXPECT_EQ(rv->GetStats().drop_samples[0].rfind("unknown-kid len=", 0), 0u);
 +  ASSERT_EQ(bob.store->SetKey(kUnitsKid, OtherBase()),
 +            SframeKeyStore::SetKeyResult::kChanged);
 +  rv->Transform(VideoFrame(unit, Direction::kReceiver));  // same KID, wrong key
@@ -3063,7 +3115,10 @@ index 0000000..bf46a42
 +  rv->Transform(
 +      VideoFrame({0x10, 0xa0, 0x01, 0x00, 0x04}, Direction::kReceiver));
 +  rv->Transform(VideoFrame({}, Direction::kReceiver));
-+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kShort), 2u);
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kShort), 1u);
++  // zero-length on receive = padding-only RTP (F-M2-1): 'empty', not a storm
++  // reason
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kEmpty), 1u);
 +  // A codec that is not VP8 on a video receiver is never played.
 +  rv->Transform(
 +      VideoFrame(Unhex(kUnitCases[3].unit), Direction::kReceiver, "video/VP9"));
@@ -3839,10 +3894,10 @@ index 0000000..37b0d5d
 +}
 diff --git a/sdk/android/src/jni/pc/sframe_cryptor.cc b/sdk/android/src/jni/pc/sframe_cryptor.cc
 new file mode 100644
-index 0000000..12d9b63
+index 0000000..37f8e44
 --- /dev/null
 +++ b/sdk/android/src/jni/pc/sframe_cryptor.cc
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,312 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — JNI for org.webrtc.SFrameKeyStore and
 + * org.webrtc.SFrameCryptor. No key byte crosses back to Java and none is
@@ -3940,6 +3995,11 @@ index 0000000..12d9b63
 +         "\":" + std::to_string(s.dropped[i]);
 +  }
 +  j += "}";
++  j += ",\"dropSamples\":[";
++  for (size_t i = 0; i < s.drop_samples.size(); ++i) {
++    j += (i ? "," : "") + JsonString(s.drop_samples[i]);
++  }
++  j += "]";
 +  j += ",\"consecutive\":" + std::to_string(s.consecutive);
 +  j += ",\"storm\":" + std::string(s.storm ? "true" : "false");
 +  j += ",\"storms\":" + std::to_string(s.storms);
