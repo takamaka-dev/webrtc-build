@@ -1433,10 +1433,10 @@ index 0000000..8e1bdc1
 +};
 diff --git a/api/crypto/sframe_transformer.cc b/api/crypto/sframe_transformer.cc
 new file mode 100644
-index 0000000..55019dc
+index 0000000..c2899bc
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.cc
-@@ -0,0 +1,885 @@
+@@ -0,0 +1,937 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame frame transformer. See
 + * sframe_transformer.h.
@@ -1768,6 +1768,58 @@ index 0000000..55019dc
 +void SframeKeyStore::SetH264Enabled(bool enabled) {
 +  MutexLock lock(&mutex_);
 +  h264_enabled_ = enabled;
++}
++
++std::vector<uint8_t> SframeKeyStore::VectorSeal(
++    std::span<const uint8_t> base_key,
++    uint64_t kid,
++    uint64_t ctr,
++    std::span<const uint8_t> frame,
++    size_t prefix_len) {
++  sframe::KeyMaterial material;
++  if (prefix_len > frame.size() || base_key.empty() ||
++      !sframe::DeriveKeyMaterial(kid, base_key, &material)) {
++    return {};
++  }
++  std::unique_ptr<sframe::SealingKey> key =
++      sframe::SealingKey::Create(kid, material);
++  if (!key) {
++    return {};
++  }
++  const std::span<const uint8_t> prefix = frame.first(prefix_len);
++  const std::vector<uint8_t> header = sframe::EncodeHeader(kid, ctr);
++  std::vector<uint8_t> out(prefix.begin(), prefix.end());
++  out.insert(out.end(), header.begin(), header.end());
++  if (!key->Seal(ctr, header, prefix, frame.subspan(prefix_len), &out)) {
++    return {};
++  }
++  return out;
++}
++
++std::optional<std::vector<uint8_t>> SframeKeyStore::VectorOpen(
++    std::span<const uint8_t> base_key,
++    uint64_t kid,
++    std::span<const uint8_t> unit,
++    size_t prefix_len) {
++  sframe::KeyMaterial material;
++  if (prefix_len >= unit.size() || base_key.empty() ||
++      !sframe::DeriveKeyMaterial(kid, base_key, &material)) {
++    return std::nullopt;
++  }
++  std::unique_ptr<sframe::SealingKey> key =
++      sframe::SealingKey::Create(kid, material);
++  const std::optional<sframe::Header> h =
++      sframe::ParseHeader(unit.subspan(prefix_len));
++  if (!key || !h || h->kid != kid) {
++    return std::nullopt;
++  }
++  const std::span<const uint8_t> prefix = unit.first(prefix_len);
++  std::vector<uint8_t> out(prefix.begin(), prefix.end());
++  if (!key->Open(h->ctr, unit.subspan(prefix_len, h->length), prefix,
++                 unit.subspan(prefix_len + h->length), &out)) {
++    return std::nullopt;
++  }
++  return out;
 +}
 +
 +std::vector<SframeStreamStats> SframeKeyStore::GetAllStats() const {
@@ -2324,10 +2376,10 @@ index 0000000..55019dc
 +}  // namespace webrtc
 diff --git a/api/crypto/sframe_transformer.h b/api/crypto/sframe_transformer.h
 new file mode 100644
-index 0000000..596730b
+index 0000000..6ceee5c
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.h
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,322 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame (RFC 9605) frame transformer
 + * of the native engine.
@@ -2388,9 +2440,9 @@ index 0000000..596730b
 +// worker's.
 +enum class SframeDropReason {
 +  kEmpty = 0,  // zero-length frame (sender: no Opus TOC; spec §9.1 [0.2])
-+  kCodec,  // not Opus (audio) / not VP8 (video) / H.264 not enabled — never
-+           // sent or played
-+  kNoKey,  // sender: no send KID or no key for it
++  kCodec,      // not Opus (audio) / not VP8 (video) / H.264 not enabled — never
++               // sent or played
++  kNoKey,      // sender: no send KID or no key for it
 +  kCtrExhausted,  // sender: CTR reached kCtrLimit — needs a new epoch
 +  kShort,         // receiver: shorter than prefix + 1 + tag
 +  kBadHeader,     // receiver: truncated / non-minimal SFrame header
@@ -2520,6 +2572,25 @@ index 0000000..596730b
 +  // the layout is fixed by test (a) on the fork (OPEN H-1 of the M1 report).
 +  void SetH264Enabled(bool enabled);
 +
++  // Vector checks for the platform bindings (JNI / Flutter platform channel):
++  // seal / open ONE Opus- or VP8-shaped unit (clear prefix of `prefix_len`
++  // bytes) with the same derivation and AEAD code the transformer uses, under
++  // a key derived from `base_key` for `kid` and an explicit `ctr`. Static on
++  // purpose: they never touch a store's live keys, CTR counters or replay
++  // windows, so they cannot reuse a live (key, nonce) pair. Empty / nullopt on
++  // any error (bad base key, prefix longer than the input, bad header, other
++  // KID, bad tag).
++  static std::vector<uint8_t> VectorSeal(std::span<const uint8_t> base_key,
++                                         uint64_t kid,
++                                         uint64_t ctr,
++                                         std::span<const uint8_t> frame,
++                                         size_t prefix_len);
++  static std::optional<std::vector<uint8_t>> VectorOpen(
++      std::span<const uint8_t> base_key,
++      uint64_t kid,
++      std::span<const uint8_t> unit,
++      size_t prefix_len);
++
 + protected:
 +  explicit SframeKeyStore(Clock* clock);
 +  ~SframeKeyStore() override;
@@ -2633,10 +2704,10 @@ index 0000000..596730b
 +#endif  // API_CRYPTO_SFRAME_TRANSFORMER_H_
 diff --git a/api/crypto/sframe_transformer_unittest.cc b/api/crypto/sframe_transformer_unittest.cc
 new file mode 100644
-index 0000000..0ec201f
+index 0000000..bf46a42
 --- /dev/null
 +++ b/api/crypto/sframe_transformer_unittest.cc
-@@ -0,0 +1,847 @@
+@@ -0,0 +1,867 @@
 +/*
 + * C182 / DR-055 — the SFrame transformer: our vectors through the
 + * FrameTransformerInterface, the fail-closed negative controls (CM-1, CM-2,
@@ -2851,6 +2922,26 @@ index 0000000..0ec201f
 +  EXPECT_EQ(Hex(rv[1]), kUnitCases[3].frame);
 +  EXPECT_EQ(rvideo->GetStats().passed, 2u);
 +  EXPECT_EQ(rvideo->GetStats().dropped_total(), 0u);
++}
++
++TEST(SframeTransformer, VectorSealAndOpenSeamsReproduceTheJavaUnits) {
++  for (const UnitCase& c : kUnitCases) {
++    const std::vector<uint8_t> unit = SframeKeyStore::VectorSeal(
++        kBase, kUnitsKid, c.ctr, Unhex(c.frame), c.prefix_len);
++    EXPECT_EQ(Hex(unit), c.unit);
++    std::optional<std::vector<uint8_t>> frame = SframeKeyStore::VectorOpen(
++        kBase, kUnitsKid, Unhex(c.unit), c.prefix_len);
++    ASSERT_TRUE(frame);
++    EXPECT_EQ(Hex(*frame), c.frame);
++  }
++  std::vector<uint8_t> t = Unhex(kUnitCases[0].unit);
++  t.back() ^= 1;
++  EXPECT_FALSE(SframeKeyStore::VectorOpen(kBase, kUnitsKid, t, 1));
++  EXPECT_FALSE(SframeKeyStore::VectorOpen(OtherBase(), kUnitsKid,
++                                          Unhex(kUnitCases[0].unit), 1));
++  EXPECT_FALSE(SframeKeyStore::VectorOpen(kBase, kUnitsKid + 1,
++                                          Unhex(kUnitCases[0].unit), 1));
++  EXPECT_TRUE(SframeKeyStore::VectorSeal(kBase, kUnitsKid, 0, {}, 1).empty());
 +}
 +
 +// ---- CM-2: nothing passes in plaintext while a key is missing
@@ -3592,10 +3683,10 @@ index 0000000..4861466
 +}
 diff --git a/sdk/android/api/org/webrtc/SFrameKeyStore.java b/sdk/android/api/org/webrtc/SFrameKeyStore.java
 new file mode 100644
-index 0000000..09fd1fd
+index 0000000..37b0d5d
 --- /dev/null
 +++ b/sdk/android/api/org/webrtc/SFrameKeyStore.java
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,150 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055).
 + *
@@ -3702,6 +3793,21 @@ index 0000000..09fd1fd
 +    return nativeGetStatsJson(nativeKeyStore);
 +  }
 +
++  /**
++   * Vector check (no live key involved): seals ONE Opus/VP8-shaped unit with the transformer's own derivation and
++   * AEAD, under the key of {@code kid} derived from {@code baseKey}, with an explicit {@code ctr}. Null on error.
++   */
++  @Nullable
++  public static byte[] vectorSeal(byte[] baseKey, long kid, long ctr, byte[] frame, int prefixLen) {
++    return nativeVectorSeal(baseKey, kid, ctr, frame, prefixLen);
++  }
++
++  /** Vector check: opens ONE unit sealed under {@code kid}/{@code baseKey}. Null on any failure (bad tag, other KID). */
++  @Nullable
++  public static byte[] vectorOpen(byte[] baseKey, long kid, byte[] unit, int prefixLen) {
++    return nativeVectorOpen(baseKey, kid, unit, prefixLen);
++  }
++
 +  public void dispose() {
 +    checkExists();
 +    nativeSetObserver(nativeKeyStore, null);
@@ -3726,13 +3832,17 @@ index 0000000..09fd1fd
 +  private static native void nativeSetH264Enabled(long keyStore, boolean enabled);
 +  private static native void nativeSetObserver(long keyStore, @Nullable Observer observer);
 +  private static native String nativeGetStatsJson(long keyStore);
++  @Nullable
++  private static native byte[] nativeVectorSeal(byte[] baseKey, long kid, long ctr, byte[] frame, int prefixLen);
++  @Nullable
++  private static native byte[] nativeVectorOpen(byte[] baseKey, long kid, byte[] unit, int prefixLen);
 +}
 diff --git a/sdk/android/src/jni/pc/sframe_cryptor.cc b/sdk/android/src/jni/pc/sframe_cryptor.cc
 new file mode 100644
-index 0000000..eccb7d8
+index 0000000..12d9b63
 --- /dev/null
 +++ b/sdk/android/src/jni/pc/sframe_cryptor.cc
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,307 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — JNI for org.webrtc.SFrameKeyStore and
 + * org.webrtc.SFrameCryptor. No key byte crosses back to Java and none is
@@ -3942,6 +4052,61 @@ index 0000000..eccb7d8
 +    j += StatsJson(s);
 +  }
 +  return NativeToJavaString(env, j + "]");
++}
++
++static ScopedJavaLocalRef<jbyteArray> JNI_SFrameKeyStore_VectorSeal(
++    JNIEnv* env,
++    const JavaParamRef<jbyteArray>& j_base_key,
++    jlong j_kid,
++    jlong j_ctr,
++    const JavaParamRef<jbyteArray>& j_frame,
++    jint j_prefix_len) {
++  if (j_base_key.is_null() || j_frame.is_null() || j_kid < 0 || j_ctr < 0 ||
++      j_prefix_len < 0) {
++    return nullptr;
++  }
++  std::vector<int8_t> base = JavaToNativeByteArray(env, j_base_key);
++  const std::vector<int8_t> frame = JavaToNativeByteArray(env, j_frame);
++  const std::vector<uint8_t> unit = SframeKeyStore::VectorSeal(
++      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(base.data()),
++                               base.size()),
++      static_cast<uint64_t>(j_kid), static_cast<uint64_t>(j_ctr),
++      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(frame.data()),
++                               frame.size()),
++      static_cast<size_t>(j_prefix_len));
++  std::fill(base.begin(), base.end(), 0);
++  if (unit.empty()) {
++    return nullptr;
++  }
++  std::vector<int8_t> out(unit.begin(), unit.end());
++  return NativeToJavaByteArray(env, std::span<int8_t>(out));
++}
++
++static ScopedJavaLocalRef<jbyteArray> JNI_SFrameKeyStore_VectorOpen(
++    JNIEnv* env,
++    const JavaParamRef<jbyteArray>& j_base_key,
++    jlong j_kid,
++    const JavaParamRef<jbyteArray>& j_unit,
++    jint j_prefix_len) {
++  if (j_base_key.is_null() || j_unit.is_null() || j_kid < 0 ||
++      j_prefix_len < 0) {
++    return nullptr;
++  }
++  std::vector<int8_t> base = JavaToNativeByteArray(env, j_base_key);
++  const std::vector<int8_t> unit = JavaToNativeByteArray(env, j_unit);
++  const std::optional<std::vector<uint8_t>> frame = SframeKeyStore::VectorOpen(
++      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(base.data()),
++                               base.size()),
++      static_cast<uint64_t>(j_kid),
++      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(unit.data()),
++                               unit.size()),
++      static_cast<size_t>(j_prefix_len));
++  std::fill(base.begin(), base.end(), 0);
++  if (!frame) {
++    return nullptr;
++  }
++  std::vector<int8_t> out(frame->begin(), frame->end());
++  return NativeToJavaByteArray(env, std::span<int8_t>(out));
 +}
 +
 +// ---- SFrameCryptor
