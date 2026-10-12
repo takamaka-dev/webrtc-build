@@ -218,7 +218,11 @@ PATCH_INFO = {
 }
 
 PATCHES = {
-    'apple': [],
+    # C182 / DR-055 (Takamaka): the same tkm_sframe.patch as Android, which also carries the Objective-C API
+    # (RTCSFrameKeyStore / RTCSFrameCryptor). Built by .github/workflows/tkm-ios.yml (iOS slices only).
+    'apple': [
+        'tkm_sframe.patch',
+    ],
     'apple_prefixed': [
         'apple_prefix.patch',
     ],

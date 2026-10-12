@@ -1,0 +1,168 @@
+# C182 / DR-055 (Takamaka): the iOS WebRTC.xcframework with the RFC 9605 SFrame transformer (tkm_sframe.patch:
+# api/crypto/sframe_* + the Objective-C API RTCSFrameKeyStore / RTCSFrameCryptor), from the SAME webrtc commit as the
+# Android AAR (build/TKM_IOS_VERSION). iOS only, 3 slices: arm64 device, arm64 + x86_64 simulator (the x86_64 slice is
+# required: the build iMac is Intel). No secret: GITHUB_TOKEN publishes the pre-release; no signing (the app signs the
+# embedded framework).
+name: tkm-ios-xcframework
+
+on:
+  workflow_dispatch:
+    inputs:
+      webrtcCommit:
+        description: 'webrtc-sdk/webrtc commit (empty = TKM_WEBRTC_COMMIT in build/TKM_IOS_VERSION; MUST equal the Android AAR base)'
+        default: ''
+        required: false
+      configuration:
+        description: 'release | debug'
+        default: 'release'
+        type: choice
+        options: [release, debug]
+  push:
+    branches:
+      - 'feat/C182-sframe-transformer'
+    paths:
+      - '.github/workflows/tkm-ios.yml'
+      - 'build/apple/tkm_xcframework.sh'
+      - 'build/patches/tkm_sframe.patch'
+      - 'build/TKM_IOS_VERSION'
+    tags:
+      - 'ios-c182-sframe.*'
+
+permissions:
+  contents: write   # the pre-release only; GITHUB_TOKEN, no PAT
+
+concurrency:
+  group: tkm-ios-${{ github.ref }}
+  cancel-in-progress: false   # never kill a 1-2 h build half way
+
+jobs:
+  build-ios:
+    runs-on: macos-26          # arm64 image; /Applications/Xcode_26.0.app = 26.0.1 (same Xcode as upstream's apple job)
+    timeout-minutes: 330
+    defaults:
+      run:
+        working-directory: ./build
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      sha256: ${{ steps.sum.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode 26.0
+        run: sudo xcode-select --switch /Applications/Xcode_26.0.app/Contents/Developer
+
+      - name: Pin
+        id: meta
+        run: |
+          C="${{ github.event.inputs.webrtcCommit }}"
+          [ -n "$C" ] || C=$(grep '^TKM_WEBRTC_COMMIT=' TKM_IOS_VERSION | cut -d= -f2)
+          V=$(grep '^TKM_IOS_VERSION=' TKM_IOS_VERSION | cut -d= -f2)
+          if [ "${{ github.ref_type }}" = "tag" ]; then T="${{ github.ref_name }}"; else T=$(grep '^TKM_IOS_RELEASE_TAG=' TKM_IOS_VERSION | cut -d= -f2); fi
+          echo "webrtc commit $C, version $V, release tag $T"
+          echo "TKM_WEBRTC_COMMIT=$C" >> "$GITHUB_ENV"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$T" >> "$GITHUB_OUTPUT"
+          grep -n "tkm_sframe.patch" run.py
+          df -h /
+
+      # run.py: clone webrtc-sdk/webrtc, checkout the commit, gclient sync, then apply PATCHES['apple'] (= tkm_sframe.patch).
+      - name: Fetch + patch
+        run: python3 run.py build apple --commit "$TKM_WEBRTC_COMMIT" --webrtc-fetch
+
+      - name: Pin and patch applied? (fail closed)
+        run: |
+          S=_source/apple/webrtc/src
+          test "$(git -C $S rev-parse HEAD)" = "$TKM_WEBRTC_COMMIT"
+          test -f $S/api/crypto/sframe_transformer.h
+          test -f $S/sdk/objc/api/peerconnection/RTCSFrameKeyStore.mm
+          test -f $S/sdk/objc/api/peerconnection/RTCSFrameCryptor.mm
+          grep -q RTCSFrameKeyStore.h $S/sdk/BUILD.gn
+          df -h /
+
+      - name: Build xcframework (3 iOS slices)
+        run: |
+          export PATH="$PWD/_source/apple/depot_tools:$PATH"
+          mkdir -p _package/tkm-ios
+          bash apple/tkm_xcframework.sh "${{ github.event.inputs.configuration || 'release' }}" _source/apple/webrtc/src _package/tkm-ios
+
+      - name: The SFrame API is in every slice, the x86_64 simulator slice exists (fail closed)
+        run: |
+          X=_package/tkm-ios/WebRTC.xcframework
+          ls "$X"
+          for B in "$X"/ios-*/WebRTC.framework/WebRTC; do
+            echo "== $B"; lipo -info "$B"
+            nm -gU "$B" | grep -E '_OBJC_CLASS_\$_RTCSFrame(KeyStore|Cryptor)$'
+            test "$(nm -gU "$B" | grep -cE '_OBJC_CLASS_\$_RTCSFrame(KeyStore|Cryptor)$')" -ge 2
+            otool -l "$B" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|sdk' | sort -u
+          done
+          lipo -info "$X"/ios-*-simulator/WebRTC.framework/WebRTC | grep -q x86_64
+          lipo -info "$X"/ios-*-simulator/WebRTC.framework/WebRTC | grep -q arm64
+          ls "$X"/ios-*/WebRTC.framework/Headers/RTCSFrameKeyStore.h "$X"/ios-*/WebRTC.framework/Headers/RTCSFrameCryptor.h
+          grep -h RTCSFrame "$X"/ios-*/WebRTC.framework/Headers/*.h | grep import || echo "::warning::RTCSFrame headers not imported by an umbrella header"
+
+      - name: Checksum + provenance
+        id: sum
+        run: |
+          cd _package/tkm-ios
+          Z="WebRTC-${{ steps.meta.outputs.version }}.xcframework.zip"
+          mv WebRTC.xcframework.zip "$Z"
+          shasum -a 256 "$Z" | tee "$Z.sha256"
+          echo "sha256=$(cut -d' ' -f1 "$Z.sha256")" >> "$GITHUB_OUTPUT"
+          { echo "artefact=$Z";
+            echo "version=${{ steps.meta.outputs.version }}";
+            echo "webrtc_repo=https://github.com/webrtc-sdk/webrtc.git";
+            echo "webrtc_commit=$TKM_WEBRTC_COMMIT";
+            echo "build_repo=$GITHUB_REPOSITORY";
+            echo "build_repo_commit=$GITHUB_SHA";
+            echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID";
+            echo "patch_sha256=$(shasum -a 256 ../../patches/tkm_sframe.patch | cut -d' ' -f1)";
+            echo "xcode=$(xcodebuild -version | tr '\n' ' ')";
+            echo "slices=ios-arm64 ios-arm64_x86_64-simulator"; } > PROVENANCE.txt
+          cat PROVENANCE.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tkm-WebRTC-${{ steps.meta.outputs.version }}.xcframework
+          path: |
+            build/_package/tkm-ios/WebRTC-*.xcframework.zip
+            build/_package/tkm-ios/WebRTC-*.xcframework.zip.sha256
+            build/_package/tkm-ios/PROVENANCE.txt
+          retention-days: 90
+
+  # A pre-release, so the framework can be fetched without a token (artifact downloads need one). On a tag push the
+  # release is that tag; on a branch push it is TKM_IOS_RELEASE_TAG, created only if it does not exist yet (bump the
+  # file for a new one) - so a failed build never leaves a tag behind.
+  release:
+    needs: build-ios
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release tag free?
+        id: free
+        env:
+          T: ${{ needs.build-ios.outputs.release_tag }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/$T" >/dev/null; then
+            echo "tag $T exists: not overwriting it (bump TKM_IOS_RELEASE_TAG)"; echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.free.outputs.go == 'true'
+        with:
+          name: tkm-WebRTC-${{ needs.build-ios.outputs.version }}.xcframework
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        if: steps.free.outputs.go == 'true'
+        with:
+          tag_name: ${{ needs.build-ios.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: "C182 iOS WebRTC.xcframework ${{ needs.build-ios.outputs.version }} (SFrame)"
+          prerelease: true
+          body: |
+            WebRTC.xcframework (iOS: arm64 device, arm64 + x86_64 simulator) with the C182 RFC 9605 SFrame transformer and its
+            Objective-C API (RTCSFrameKeyStore, RTCSFrameCryptor). Same webrtc commit as the Android AAR (see PROVENANCE.txt).
+            sha256 of the zip: ${{ needs.build-ios.outputs.sha256 }}
+          files: artifacts/**

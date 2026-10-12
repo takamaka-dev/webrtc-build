@@ -232,3 +232,13 @@ the host test target `sframe_unittests`, and the Android API `org.webrtc.SFrameK
 (`sdk/android/src/jni/pc/sframe_cryptor.cc`). Fail closed: no enable switch, no pass-through, no magic trailer, no default
 key. Generated with `git diff 67c45788424e3ec9df1ebc53e0269d9d5f09295b feat/C182-sframe-transformer` in the fork checkout;
 applied last, after `jni_prefix.patch` for the prefixed targets. Not yet applied to Apple targets (no ObjC binding yet).
+
+### tkm_sframe.patch on Apple (C182, 2026-10-12)
+
+Since `150.7871.03-tkm.5` the patch also carries the Objective-C API of the SFrame transformer
+(`sdk/objc/api/peerconnection/RTCSFrameKeyStore.{h,mm}`, `RTCSFrameKeyStore+Private.h`, `RTCSFrameCryptor.{h,mm}`,
+registered in `sdk/BUILD.gn` and the iOS/macOS umbrella header lists) and is applied to the `apple` target.
+The iOS-only xcframework is built by `.github/workflows/tkm-ios.yml` from `TKM_WEBRTC_COMMIT` in `build/TKM_IOS_VERSION`
+(= the Android AAR's base, webrtc-sdk/webrtc `67c45788`). Relative to tkm.4 the patch adds ONLY those Objective-C files:
+`api/crypto/` and `sdk/android/` are byte-identical, so the Android AAR `150.7871.03-tkm.4` and the iOS framework carry
+the same transformer.

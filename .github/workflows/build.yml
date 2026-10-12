@@ -24,8 +24,13 @@ on:
       - '.dockerignore'
     branches-ignore:
       - daily
+      # C182 (Takamaka fork): our branches build through tkm-ios.yml (iOS) and locally (Android); the upstream matrix
+      # would run 3 stock macOS jobs and queue 3 jobs for a runner label this fork does not have.
+      - 'feat/C182-**'
     tags:
       - '*'
+      - '!android-c182-*'
+      - '!ios-c182-*'
 
 permissions:
   packages: write
