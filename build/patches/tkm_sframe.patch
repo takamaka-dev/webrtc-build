@@ -1433,10 +1433,10 @@ index 0000000..8e1bdc1
 +};
 diff --git a/api/crypto/sframe_transformer.cc b/api/crypto/sframe_transformer.cc
 new file mode 100644
-index 0000000..18b1859
+index 0000000..9f5a60a
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.cc
-@@ -0,0 +1,977 @@
+@@ -0,0 +1,1175 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame frame transformer. See
 + * sframe_transformer.h.
@@ -1445,6 +1445,7 @@ index 0000000..18b1859
 +#include "api/crypto/sframe_transformer.h"
 +
 +#include <algorithm>
++#include <deque>
 +#include <cctype>
 +#include <string_view>
 +#include <utility>
@@ -1555,6 +1556,10 @@ index 0000000..18b1859
 +      return "no-sink";
 +    case SframeDropReason::kInternal:
 +      return "internal";
++    case SframeDropReason::kHeldExpired:
++      return "held-expired";
++    case SframeDropReason::kHeldOverflow:
++      return "held-overflow";
 +    case SframeDropReason::kCount:
 +      break;
 +  }
@@ -1564,11 +1569,15 @@ index 0000000..18b1859
 +bool SframeDropCountsForStorm(SframeDropReason reason) {
 +  // The web worker's COUNTS_FOR_STORM ('bad-tag', 'unknown-kid', 'bad-header',
 +  // 'short') + H.264 'malformed'.
++  // C-24: a held frame whose key never came (or that overflowed the hold) is
++  // an unknown-kid drop that waited.
 +  return reason == SframeDropReason::kBadTag ||
 +         reason == SframeDropReason::kUnknownKid ||
 +         reason == SframeDropReason::kBadHeader ||
 +         reason == SframeDropReason::kShort ||
-+         reason == SframeDropReason::kMalformed;
++         reason == SframeDropReason::kMalformed ||
++         reason == SframeDropReason::kHeldExpired ||
++         reason == SframeDropReason::kHeldOverflow;
 +}
 +
 +const char* SframeEventTypeName(SframeEvent::Type type) {
@@ -1589,6 +1598,10 @@ index 0000000..18b1859
 +      return "key-expired";
 +    case SframeEvent::Type::kKeyEvicted:
 +      return "key-evicted";
++    case SframeEvent::Type::kHeld:
++      return "held";
++    case SframeEvent::Type::kReleased:
++      return "released";
 +  }
 +  return "?";
 +}
@@ -1625,6 +1638,7 @@ index 0000000..18b1859
 +    return SetKeyResult::kInvalid;
 +  }
 +  Events events;
++  std::vector<Delivery> deliveries;
 +  SetKeyResult result;
 +  {
 +    MutexLock lock(&mutex_);
@@ -1686,9 +1700,12 @@ index 0000000..18b1859
 +        s->stats.storm = false;
 +        s->stats.consecutive = 0;
 +      }
++      // C-24: the frames held for this KID open now, in order
++      ReleaseHeldLocked(kid, &events, &deliveries);
 +    }
 +  }
 +  Dispatch(events);
++  Deliver(std::move(deliveries));
 +  return result;
 +}
 +
@@ -1759,6 +1776,24 @@ index 0000000..18b1859
 +  }
 +  MutexLock lock(&mutex_);
 +  storm_threshold_ = n;
++}
++
++void SframeKeyStore::SetHoldTime(TimeDelta hold) {
++  Events events;
++  {
++    MutexLock lock(&mutex_);
++    hold_time_ = std::max(hold, TimeDelta::Zero());
++    if (hold_time_.IsZero()) {
++      // nothing may wait any more: what is held drops now
++      for (auto& s : streams_) {
++        for (HeldFrame& h : s->held) {
++          h.deadline = Timestamp::MinusInfinity();
++        }
++      }
++      ExpireHeldLocked(&events);
++    }
++  }
++  Dispatch(events);
 +}
 +
 +void SframeKeyStore::SetObserver(scoped_refptr<SframeObserver> observer) {
@@ -1835,11 +1870,13 @@ index 0000000..18b1859
 +SframeKeyStore::Stream* SframeKeyStore::RegisterStream(
 +    const std::string& stream_id,
 +    SframeRole role,
-+    SframeMediaKind kind) {
++    SframeMediaKind kind,
++    SframeTransformer* transformer) {
 +  auto s = std::make_unique<Stream>();
 +  s->stats.stream_id = stream_id;
 +  s->stats.role = role;
 +  s->stats.kind = kind;
++  s->transformer = transformer;
 +  Stream* raw = s.get();
 +  MutexLock lock(&mutex_);
 +  streams_.push_back(std::move(s));
@@ -1878,6 +1915,7 @@ index 0000000..18b1859
 +}
 +
 +void SframeKeyStore::PurgeExpiredLocked(Events* events) {
++  ExpireHeldLocked(events);
 +  const Timestamp now = clock_->CurrentTime();
 +  for (auto it = keys_.begin(); it != keys_.end();) {
 +    if (it->second.expires_at && *it->second.expires_at <= now) {
@@ -1974,9 +2012,12 @@ index 0000000..18b1859
 +}
 +
 +bool SframeKeyStore::Process(Stream* stream,
-+                             const TransformableFrameInterface& frame,
++                             std::unique_ptr<TransformableFrameInterface>& frame_ptr,
 +                             std::vector<uint8_t>* out,
-+                             Events* events) {
++                             Events* events,
++                             bool* held) {
++  *held = false;
++  const TransformableFrameInterface& frame = *frame_ptr;
 +  MutexLock lock(&mutex_);
 +  PurgeExpiredLocked(events);
 +  SframeStreamStats& st = stream->stats;
@@ -2015,12 +2056,30 @@ index 0000000..18b1859
 +                      : OpenLocked(stream, frame, out, &why, &kid);
 +  if (!ok) {
 +    out->clear();
++    if (why == SframeDropReason::kUnknownKid && st.last_kid &&
++        ShouldHoldLocked(stream, *st.last_kid)) {
++      // C-24: the key of a known leg's next epoch has not arrived yet — wait
++      // for it instead of breaking the decoder's reference chain
++      HoldLocked(stream, std::move(frame_ptr), *st.last_kid, events);
++      *held = true;
++      return false;
++    }
 +    DropLocked(stream, why, events);
 +    SampleDrop(stream, why, data);
 +    return false;
 +  }
++  PassLocked(stream, kid, out->size(), events);
++  return true;
++}
++
++void SframeKeyStore::PassLocked(Stream* stream,
++                                uint64_t kid,
++                                size_t out_bytes,
++                                Events* events) {
++  SframeStreamStats& st = stream->stats;
++  const Timestamp now = clock_->CurrentTime();
 +  st.passed++;
-+  st.bytes_out += out->size();
++  st.bytes_out += out_bytes;
 +  stream->last_reported_drop.reset();
 +  if (!st.first_pass_at) {
 +    st.first_pass_at = now;
@@ -2054,7 +2113,141 @@ index 0000000..18b1859
 +      }
 +    }
 +  }
-+  return true;
++}
++
++// ---- C-24 hold
++// ----------------------------------------------------------------------------------------------------
++
++bool SframeKeyStore::ShouldHoldLocked(const Stream* stream,
++                                      uint64_t kid) const {
++  if (hold_time_.IsZero() || stream->stats.role != SframeRole::kReceiver ||
++      stream->stats.kind != SframeMediaKind::kVideo ||
++      !sframe::IsAssignableKid(kid)) {
++    return false;
++  }
++  const uint32_t leg = sframe::LegIndexOf(kid);
++  for (const auto& [k, e] : keys_) {
++    if (sframe::LegIndexOf(k) != leg) {
++      continue;
++    }
++    const uint32_t ahead =
++        (sframe::EpochOf(kid) - sframe::EpochOf(k)) & 0xFFFF;
++    if (ahead >= 1 && ahead <= kHoldEpochsAhead) {
++      return true;  // a known leg, an epoch this receiver has not reached
++    }
++  }
++  return false;
++}
++
++void SframeKeyStore::HoldLocked(Stream* stream,
++                                std::unique_ptr<TransformableFrameInterface> frame,
++                                uint64_t kid,
++                                Events* events) {
++  SframeStreamStats& st = stream->stats;
++  const size_t bytes = frame->GetData().size();
++  while (!stream->held.empty() &&
++         (stream->held.size() >= kMaxHeldFrames ||
++          stream->held_bytes + bytes > kMaxHeldBytes)) {
++    HeldFrame& old = stream->held.front();
++    stream->held_bytes -= old.bytes;
++    st.held_now--;
++    DropLocked(stream, SframeDropReason::kHeldOverflow, events);
++    SampleDrop(stream, SframeDropReason::kHeldOverflow, old.frame->GetData());
++    stream->held.pop_front();
++  }
++  const bool first = stream->held.empty();
++  HeldFrame h;
++  h.frame = std::move(frame);
++  h.kid = kid;
++  h.deadline = clock_->CurrentTime() + hold_time_;
++  h.bytes = bytes;
++  stream->held.push_back(std::move(h));
++  stream->held_bytes += bytes;
++  st.held++;
++  st.held_now++;
++  if (first) {
++    SframeEvent e;
++    e.type = SframeEvent::Type::kHeld;
++    e.stream_id = st.stream_id;
++    e.role = st.role;
++    e.kind = st.kind;
++    e.kid = kid;
++    events->push_back(e);
++  }
++}
++
++void SframeKeyStore::ReleaseHeldLocked(uint64_t kid,
++                                       Events* events,
++                                       std::vector<Delivery>* deliveries) {
++  for (auto& s : streams_) {
++    if (s->held.empty()) {
++      continue;
++    }
++    std::deque<HeldFrame> keep;
++    uint64_t released = 0;
++    for (HeldFrame& h : s->held) {
++      if (h.kid != kid) {
++        keep.push_back(std::move(h));
++        continue;
++      }
++      s->held_bytes -= h.bytes;
++      s->stats.held_now--;
++      std::vector<uint8_t> out;
++      SframeDropReason why = SframeDropReason::kInternal;
++      uint64_t opened_kid = 0;
++      const bool ok = OpenLocked(s.get(), *h.frame, &out, &why, &opened_kid);
++      if (!ok) {
++        DropLocked(s.get(), why, events);
++        SampleDrop(s.get(), why, h.frame->GetData());
++        continue;
++      }
++      scoped_refptr<TransformedFrameCallback> sink =
++          s->transformer ? s->transformer->SinkFor(h.frame->GetSsrc())
++                         : nullptr;
++      if (!sink) {
++        DropLocked(s.get(), SframeDropReason::kNoSink, events);
++        continue;
++      }
++      h.frame->SetData(out);
++      PassLocked(s.get(), opened_kid, out.size(), events);
++      s->stats.held_released++;
++      released++;
++      deliveries->push_back(Delivery{std::move(sink), std::move(h.frame)});
++    }
++    s->held = std::move(keep);
++    if (released > 0) {
++      SframeEvent e;
++      e.type = SframeEvent::Type::kReleased;
++      e.stream_id = s->stats.stream_id;
++      e.role = s->stats.role;
++      e.kind = s->stats.kind;
++      e.kid = kid;
++      e.count = released;
++      events->push_back(e);
++    }
++  }
++}
++
++void SframeKeyStore::ExpireHeldLocked(Events* events) {
++  const Timestamp now = clock_->CurrentTime();
++  for (auto& s : streams_) {
++    // deadlines are in insertion order (one hold time per store)
++    while (!s->held.empty() && s->held.front().deadline <= now) {
++      HeldFrame& h = s->held.front();
++      s->held_bytes -= h.bytes;
++      s->stats.held_now--;
++      DropLocked(s.get(), SframeDropReason::kHeldExpired, events);
++      SampleDrop(s.get(), SframeDropReason::kHeldExpired,
++                 h.frame->GetData());
++      s->held.pop_front();
++    }
++  }
++}
++
++void SframeKeyStore::Deliver(std::vector<Delivery> deliveries) {
++  for (Delivery& d : deliveries) {
++    d.sink->OnTransformedFrame(std::move(d.frame));
++  }
 +}
 +
 +bool SframeKeyStore::SealLocked(Stream* stream,
@@ -2348,7 +2541,7 @@ index 0000000..18b1859
 +    : store_(std::move(store)),
 +      role_(role),
 +      kind_(kind),
-+      stream_(store_->RegisterStream(stream_id, role, kind)) {}
++      stream_(store_->RegisterStream(stream_id, role, kind, this)) {}
 +
 +SframeTransformer::~SframeTransformer() {
 +  store_->UnregisterStream(stream_);
@@ -2377,12 +2570,17 @@ index 0000000..18b1859
 +  SframeKeyStore::Events events;
 +  std::vector<uint8_t> out;
 +  bool ok = false;
++  bool held = false;
 +  if (!sink) {
 +    store_->RecordNoSink(stream_, frame->GetData().size(), &events);
 +  } else {
-+    ok = store_->Process(stream_, *frame, &out, &events);
++    ok = store_->Process(stream_, frame, &out, &events, &held);
 +  }
 +  store_->Dispatch(events);
++  if (held) {
++    return;  // C-24: the store owns the frame until its key arrives (SetKey
++             // delivers it) or the hold expires
++  }
 +  if (!ok) {
 +    return;  // dropped: neither plaintext nor ciphertext goes further
 +  }
@@ -2416,10 +2614,10 @@ index 0000000..18b1859
 +}  // namespace webrtc
 diff --git a/api/crypto/sframe_transformer.h b/api/crypto/sframe_transformer.h
 new file mode 100644
-index 0000000..e50adbb
+index 0000000..2befe36
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.h
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,395 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame (RFC 9605) frame transformer
 + * of the native engine.
@@ -2452,6 +2650,7 @@ index 0000000..e50adbb
 +
 +#include <array>
 +#include <cstdint>
++#include <deque>
 +#include <map>
 +#include <memory>
 +#include <optional>
@@ -2496,6 +2695,10 @@ index 0000000..e50adbb
 +                  // header, bad escaping, mixed KIDs
 +  kNoSink,        // no TransformedFrameCallback registered for the frame's SSRC
 +  kInternal,      // direction mismatch, BoringSSL failure
++  kHeldExpired,   // receiver (video): held for the key of a known leg's next
++                  // epoch that never arrived within the hold time (C-24)
++  kHeldOverflow,  // receiver (video): the hold queue was full; the oldest held
++                  // frame was dropped (C-24)
 +  kCount
 +};
 +RTC_EXPORT const char* SframeDropReasonName(SframeDropReason reason);
@@ -2516,6 +2719,11 @@ index 0000000..e50adbb
 +  uint64_t consecutive = 0;  // consecutive storm-counting drops (receiver)
 +  bool storm = false;  // spec §9.2 storm: the app pauses this subscription
 +  uint64_t storms = 0;
++  // Receiver video only (spec §9.2 [0.3], C-24): frames under a KID of a known
++  // leg's NEXT epoch(s) are held until their key arrives instead of dropped.
++  uint64_t held = 0;           // frames that entered the hold
++  uint64_t held_released = 0;  // of which opened and delivered when the key came
++  uint64_t held_now = 0;       // currently held
 +  std::optional<uint64_t> last_kid;
 +  std::optional<Timestamp> first_frame_at;
 +  std::optional<Timestamp> first_pass_at;
@@ -2543,6 +2751,10 @@ index 0000000..e50adbb
 +    kKeyExpired,  // a retired key reached its retention deadline and was
 +                  // removed
 +    kKeyEvicted,  // a key was removed because its leg exceeded kMaxKeysPerLeg
++    kHeld,        // a receive stream started holding frames for `kid` (its key
++                  // is missing; C-24)
++    kReleased,    // `count` held frames of a receive stream were opened and
++                  // delivered after the key of `kid` arrived (C-24)
 +  };
 +  Type type = Type::kEngaged;
 +  std::string stream_id;  // empty for key events
@@ -2552,6 +2764,7 @@ index 0000000..e50adbb
 +      SframeDropReason::kCount;  // kDropping / kStorm: the triggering reason
 +  std::optional<uint64_t> kid;
 +  uint64_t consecutive = 0;
++  uint64_t count = 0;  // kReleased: frames released
 +};
 +RTC_EXPORT const char* SframeEventTypeName(SframeEvent::Type type);
 +
@@ -2578,6 +2791,18 @@ index 0000000..e50adbb
 +  static constexpr size_t kMaxKeysPerLeg =
 +      4;  // spec §9.2 K-2: "a cap of a few epochs bounds memory"
 +  static constexpr int kDefaultStormThreshold = 30;
++  // C-24 (spec §9.2 [0.3]): a VIDEO frame whose KID has no key, but whose leg
++  // has a key for an epoch 1..kHoldEpochsAhead behind the frame's, is HELD
++  // until the key arrives (SetKey releases it, in order), at most `hold time`
++  // (default 10 s = the `retention` default), at most kMaxHeldFrames /
++  // kMaxHeldBytes per stream (beyond that the oldest is dropped
++  // kHeldOverflow). A dropped frame at an epoch switch breaks the VP8
++  // reference chain until a keyframe (a 0.5 s freeze per rotation, C-24);
++  // a held one costs only the key's lateness. Audio is never held (Opus PLC).
++  static constexpr uint32_t kHoldEpochsAhead = 8;
++  static constexpr size_t kMaxHeldFrames = 300;
++  static constexpr size_t kMaxHeldBytes = 8 * 1024 * 1024;
++  static constexpr int64_t kDefaultHoldMs = 10000;
 +
 +  // `clock` = nullptr → the real-time clock.
 +  static scoped_refptr<SframeKeyStore> Create(Clock* clock = nullptr);
@@ -2609,6 +2834,9 @@ index 0000000..e50adbb
 +  bool HasKey(uint64_t kid) const;
 +  // spec §9.2 [0.2] storm rule N (initial 30).
 +  void SetStormThreshold(int n);
++  // C-24: how long a receive video stream holds frames for a missing key of a
++  // known leg's next epoch; zero disables holding (frames drop as unknown-kid).
++  void SetHoldTime(TimeDelta hold);
 +  void SetObserver(scoped_refptr<SframeObserver> observer);
 +  std::vector<SframeStreamStats> GetAllStats() const;
 +
@@ -2649,18 +2877,50 @@ index 0000000..e50adbb
 +    uint64_t installed_seq = 0;
 +    std::optional<Timestamp> expires_at;
 +  };
++  struct HeldFrame {
++    std::unique_ptr<TransformableFrameInterface> frame;
++    uint64_t kid = 0;
++    Timestamp deadline = Timestamp::MinusInfinity();
++    size_t bytes = 0;
++  };
 +  struct Stream {
 +    SframeStreamStats stats;
 +    std::optional<SframeDropReason> last_reported_drop;
++    SframeTransformer* transformer = nullptr;  // delivers released frames
++    std::deque<HeldFrame> held;                // C-24, receiver video only
++    size_t held_bytes = 0;
++  };
++  struct Delivery {
++    scoped_refptr<TransformedFrameCallback> sink;
++    std::unique_ptr<TransformableFrameInterface> frame;
 +  };
 +  using Events = std::vector<SframeEvent>;
 +
-+  // The whole per-frame work, under `mutex_`. Returns false (frame dropped) or
-+  // true with `out` = the new payload.
++  // The whole per-frame work, under `mutex_`. Returns false (frame dropped, or
++  // held: then `*held` is true and the store owns `frame`) or true with `out`
++  // = the new payload.
 +  bool Process(Stream* stream,
-+               const TransformableFrameInterface& frame,
++               std::unique_ptr<TransformableFrameInterface>& frame,
 +               std::vector<uint8_t>* out,
-+               Events* events);
++               Events* events,
++               bool* held);
++  // The bookkeeping of an opened / sealed frame (passed, first pass, storm
++  // recovery of the receiver).
++  void PassLocked(Stream* stream, uint64_t kid, size_t out_bytes, Events* events)
++      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  // C-24
++  bool ShouldHoldLocked(const Stream* stream, uint64_t kid) const
++      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  void HoldLocked(Stream* stream,
++                  std::unique_ptr<TransformableFrameInterface> frame,
++                  uint64_t kid,
++                  Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  void ReleaseHeldLocked(uint64_t kid,
++                         Events* events,
++                         std::vector<Delivery>* deliveries)
++      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  void ExpireHeldLocked(Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  static void Deliver(std::vector<Delivery> deliveries);
 +  bool SealLocked(Stream* stream,
 +                  const TransformableFrameInterface& frame,
 +                  std::vector<uint8_t>* out,
@@ -2682,7 +2942,8 @@ index 0000000..e50adbb
 +
 +  Stream* RegisterStream(const std::string& stream_id,
 +                         SframeRole role,
-+                         SframeMediaKind kind);
++                         SframeMediaKind kind,
++                         SframeTransformer* transformer);
 +  void UnregisterStream(Stream* stream);
 +  SframeStreamStats StatsOf(const Stream* stream) const;
 +
@@ -2694,6 +2955,7 @@ index 0000000..e50adbb
 +  uint64_t install_seq_ RTC_GUARDED_BY(mutex_) = 0;
 +  int storm_threshold_ RTC_GUARDED_BY(mutex_) = kDefaultStormThreshold;
 +  bool h264_enabled_ RTC_GUARDED_BY(mutex_) = false;
++  TimeDelta hold_time_ RTC_GUARDED_BY(mutex_) = TimeDelta::Millis(kDefaultHoldMs);
 +  std::vector<std::unique_ptr<Stream>> streams_ RTC_GUARDED_BY(mutex_);
 +  Mutex observer_mutex_;
 +  scoped_refptr<SframeObserver> observer_ RTC_GUARDED_BY(observer_mutex_);
@@ -2734,6 +2996,7 @@ index 0000000..e50adbb
 +  ~SframeTransformer() override;
 +
 + private:
++  friend class SframeKeyStore;
 +  scoped_refptr<TransformedFrameCallback> SinkFor(uint32_t ssrc);
 +
 +  const scoped_refptr<SframeKeyStore> store_;
@@ -2752,10 +3015,10 @@ index 0000000..e50adbb
 +#endif  // API_CRYPTO_SFRAME_TRANSFORMER_H_
 diff --git a/api/crypto/sframe_transformer_unittest.cc b/api/crypto/sframe_transformer_unittest.cc
 new file mode 100644
-index 0000000..93eadda
+index 0000000..0d91dab
 --- /dev/null
 +++ b/api/crypto/sframe_transformer_unittest.cc
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,1064 @@
 +/*
 + * C182 / DR-055 — the SFrame transformer: our vectors through the
 + * FrameTransformerInterface, the fail-closed negative controls (CM-1, CM-2,
@@ -3628,6 +3891,196 @@ index 0000000..93eadda
 +  EXPECT_EQ(r->GetStats().dropped_total(), 0u);
 +}
 +
++
++// ---- C-24: hold video frames of a known leg's next epoch until the key
++// arrives
++// ---------------------------------------------------------------------------------------
++
++// Alice (leg 1) rotates from epoch 4 to 5 and seals under KID(1,5) before Bob
++// installed that key: Bob HOLDS the three frames (nothing dropped, nothing
++// passed), then opens all of them, in order, the moment the key lands — the
++// VP8 reference chain stays whole (no PLI, no freeze).
++TEST(SframeTransformer, VideoUnderTheNextEpochIsHeldUntilItsKeyArrives) {
++  SimulatedClock clock(Timestamp::Seconds(1000));
++  Leg alice(&clock), bob(&clock);
++  const uint64_t e4 = kUnitsKid, e5 = kUnitsKid + 1;  // KID(1,4), KID(1,5)
++  ASSERT_EQ(alice.store->SetKey(e4, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(e4));
++  ASSERT_EQ(bob.store->SetKey(e4, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
++  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
++  auto& sent = alice.sinks["sv"]->frames;
++  auto& got = bob.sinks["rv"]->frames;
++
++  sv->Transform(VideoFrame({0x10, 1, 2, 3, 4}, Direction::kSender));
++  rv->Transform(VideoFrame(sent[0], Direction::kReceiver));
++  ASSERT_EQ(got.size(), 1u);
++
++  // the switch at the sender; Bob's key for e5 is late
++  ASSERT_EQ(alice.store->SetKey(e5, OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(e5));
++  for (uint8_t i = 1; i <= 3; ++i) {
++    sv->Transform(VideoFrame({0x10, i, i, i}, Direction::kSender));
++    clock.AdvanceTime(TimeDelta::Millis(66));
++  }
++  for (size_t i = 1; i <= 3; ++i) {
++    rv->Transform(VideoFrame(sent[i], Direction::kReceiver));
++  }
++  SframeStreamStats st = rv->GetStats();
++  EXPECT_EQ(got.size(), 1u) << "nothing passes while the key is missing";
++  EXPECT_EQ(st.dropped_total(), 0u) << "held, not dropped";
++  EXPECT_EQ(st.held, 3u);
++  EXPECT_EQ(st.held_now, 3u);
++  EXPECT_EQ(st.frames, 4u);
++  EXPECT_EQ(st.consecutive, 0u) << "a held frame does not count toward the storm";
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kHeld, "rv"), 1);
++
++  // the key lands: every held frame opens, in order, delivered by SetKey
++  ASSERT_EQ(bob.store->SetKey(e5, OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_EQ(got.size(), 4u);
++  for (uint8_t i = 1; i <= 3; ++i) {
++    EXPECT_EQ(got[i], std::vector<uint8_t>({0x10, i, i, i}));
++  }
++  st = rv->GetStats();
++  EXPECT_EQ(st.held_released, 3u);
++  EXPECT_EQ(st.held_now, 0u);
++  EXPECT_EQ(st.passed, 4u);
++  EXPECT_EQ(st.dropped_total(), 0u);
++  ASSERT_EQ(bob.recorder->Count(SframeEvent::Type::kReleased, "rv"), 1);
++  for (const SframeEvent& e : bob.recorder->events) {
++    if (e.type == SframeEvent::Type::kReleased) {
++      EXPECT_EQ(e.count, 3u);
++      EXPECT_EQ(e.kid, e5);
++    }
++  }
++  // the stream keeps working live under e5 (replay window continued)
++  sv->Transform(VideoFrame({0x10, 9}, Direction::kSender));
++  rv->Transform(VideoFrame(sent[4], Direction::kReceiver));
++  EXPECT_EQ(got.size(), 5u);
++  EXPECT_EQ(rv->GetStats().dropped_total(), 0u);
++}
++
++// A key that never comes: the held frames drop after the hold time
++// (held-expired, counting toward the storm like unknown-kid); the queue is
++// bounded (the oldest drops as held-overflow); SetHoldTime(0) turns holding
++// off (plain unknown-kid drops).
++TEST(SframeTransformer, HeldFramesExpireAndTheHoldIsBounded) {
++  SimulatedClock clock(Timestamp::Seconds(1000));
++  Leg alice(&clock), bob(&clock);
++  const uint64_t e4 = kUnitsKid, e5 = kUnitsKid + 1;
++  ASSERT_EQ(alice.store->SetKey(e5, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(e5));
++  ASSERT_EQ(bob.store->SetKey(e4, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
++  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
++  auto& sent = alice.sinks["sv"]->frames;
++
++  // expiry: 2 frames held at t0, the hold time (10 s) passes, the next
++  // frame's processing purges them
++  sv->Transform(VideoFrame({0x10, 1}, Direction::kSender));
++  sv->Transform(VideoFrame({0x10, 2}, Direction::kSender));
++  rv->Transform(VideoFrame(sent[0], Direction::kReceiver));
++  rv->Transform(VideoFrame(sent[1], Direction::kReceiver));
++  EXPECT_EQ(rv->GetStats().held_now, 2u);
++  clock.AdvanceTime(TimeDelta::Millis(SframeKeyStore::kDefaultHoldMs - 1));
++  sv->Transform(VideoFrame({0x10, 3}, Direction::kSender));
++  rv->Transform(VideoFrame(sent[2], Direction::kReceiver));  // held too
++  EXPECT_EQ(rv->GetStats().held_now, 3u);
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kHeldExpired), 0u);
++  clock.AdvanceTime(TimeDelta::Millis(1));
++  bob.store->SetSendKid(e4);  // any store entry purges: the first two expire
++  SframeStreamStats st = rv->GetStats();
++  EXPECT_EQ(Dropped(st, SframeDropReason::kHeldExpired), 2u);
++  EXPECT_EQ(st.held_now, 1u);
++  EXPECT_EQ(st.consecutive, 2u) << "an expired hold is an unknown-kid drop that waited";
++  EXPECT_EQ(st.drop_samples.size(), 2u);
++  EXPECT_EQ(st.drop_samples[0].rfind("held-expired len=", 0), 0u);
++  // the late key still opens the third frame
++  ASSERT_EQ(bob.store->SetKey(e5, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  EXPECT_EQ(bob.sinks["rv"]->frames.size(), 1u);
++  EXPECT_EQ(rv->GetStats().held_now, 0u);
++
++  // bound: a second rotation the receiver never learns of; the queue keeps
++  // the newest kMaxHeldFrames
++  const uint64_t e6 = kUnitsKid + 2;
++  ASSERT_EQ(alice.store->SetKey(e6, OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(e6));
++  const size_t before = sent.size();
++  for (size_t i = 0; i < SframeKeyStore::kMaxHeldFrames + 5; ++i) {
++    sv->Transform(VideoFrame({0x10, static_cast<uint8_t>(i)}, Direction::kSender));
++    rv->Transform(VideoFrame(sent[before + i], Direction::kReceiver));
++  }
++  st = rv->GetStats();
++  EXPECT_EQ(st.held_now, SframeKeyStore::kMaxHeldFrames);
++  EXPECT_EQ(Dropped(st, SframeDropReason::kHeldOverflow), 5u);
++  EXPECT_EQ(st.consecutive, 5u) << "an overflowing hold counts like unknown-kid drops (toward N = 30)";
++
++  // holding off: the queue drains as expired, new frames drop at once
++  bob.store->SetHoldTime(TimeDelta::Zero());
++  st = rv->GetStats();
++  EXPECT_EQ(st.held_now, 0u);
++  EXPECT_EQ(Dropped(st, SframeDropReason::kHeldExpired), 2u + SframeKeyStore::kMaxHeldFrames);
++  sv->Transform(VideoFrame({0x10, 7}, Direction::kSender));
++  rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 1u);
++}
++
++// Only VIDEO of a KNOWN leg, 1..kHoldEpochsAhead epochs AHEAD, is held: audio
++// drops (Opus PLC), an unknown leg drops (the relay's blank frame, a stranger),
++// an epoch behind the window drops (its key expired), an epoch too far ahead
++// drops; the epoch field wraps mod 2^16.
++TEST(SframeTransformer, OnlyVideoOfAKnownLegsNextEpochsIsHeld) {
++  Leg alice, bob;
++  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
++  ASSERT_EQ(bob.store->SetKey(kid(1, 65535), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
++  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
++  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
++  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "ra");
++  auto seal = [&](uint64_t k, SframeMediaKind kind) {
++    ASSERT_NE(alice.store->SetKey(k, kBase), SframeKeyStore::SetKeyResult::kInvalid);
++    ASSERT_TRUE(alice.store->SetSendKid(k));
++    if (kind == SframeMediaKind::kVideo) {
++      sv->Transform(VideoFrame({0x10, 1, 2}, Direction::kSender));
++      rv->Transform(VideoFrame(alice.sinks["sv"]->frames.back(), Direction::kReceiver));
++    } else {
++      sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
++      ra->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++    }
++  };
++  seal(kid(1, 65536), SframeMediaKind::kVideo);  // epoch 65536 ≡ 0: one ahead of 65535 (wrap)
++  EXPECT_EQ(rv->GetStats().held_now, 1u);
++  seal(kid(1, 65535 + SframeKeyStore::kHoldEpochsAhead), SframeMediaKind::kVideo);
++  EXPECT_EQ(rv->GetStats().held_now, 2u);
++  seal(kid(1, 65535 + SframeKeyStore::kHoldEpochsAhead + 1), SframeMediaKind::kVideo);  // too far ahead
++  EXPECT_EQ(rv->GetStats().held_now, 2u);
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 1u);
++  seal(kid(1, 65534), SframeMediaKind::kVideo);  // behind: its key is gone
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 2u);
++  seal(kid(2, 65536), SframeMediaKind::kVideo);  // an unknown leg
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 3u);
++  seal(kid(1, 65536), SframeMediaKind::kAudio);  // audio: never held
++  EXPECT_EQ(ra->GetStats().held_now, 0u);
++  EXPECT_EQ(Dropped(ra->GetStats(), SframeDropReason::kUnknownKid), 1u);
++  EXPECT_EQ(rv->GetStats().held_now, 2u);
++  // the two keys arrive in any order: each releases its own frame
++  ASSERT_EQ(bob.store->SetKey(kid(1, 65535 + SframeKeyStore::kHoldEpochsAhead), kBase),
++            SframeKeyStore::SetKeyResult::kChanged);
++  EXPECT_EQ(bob.sinks["rv"]->frames.size(), 1u);
++  EXPECT_EQ(rv->GetStats().held_now, 1u);
++  ASSERT_EQ(bob.store->SetKey(kid(1, 65536), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  EXPECT_EQ(bob.sinks["rv"]->frames.size(), 2u);
++  EXPECT_EQ(rv->GetStats().held_now, 0u);
++  EXPECT_EQ(rv->GetStats().held_released, 2u);
++  // a frame the sink cannot take any more (unregistered) drops as no-sink on release
++  seal(kid(1, 65537), SframeMediaKind::kVideo);
++  EXPECT_EQ(rv->GetStats().held_now, 1u);
++  rv->UnregisterTransformedFrameCallback();
++  ASSERT_EQ(bob.store->SetKey(kid(1, 65537), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kNoSink), 1u);
++  EXPECT_EQ(rv->GetStats().held_now, 0u);
++}
++
 +}  // namespace
 +}  // namespace webrtc
 diff --git a/sdk/BUILD.gn b/sdk/BUILD.gn
@@ -3781,10 +4234,10 @@ index 0000000..4861466
 +}
 diff --git a/sdk/android/api/org/webrtc/SFrameKeyStore.java b/sdk/android/api/org/webrtc/SFrameKeyStore.java
 new file mode 100644
-index 0000000..37b0d5d
+index 0000000..230704d
 --- /dev/null
 +++ b/sdk/android/api/org/webrtc/SFrameKeyStore.java
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,161 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055).
 + *
@@ -3811,12 +4264,13 @@ index 0000000..37b0d5d
 +  }
 +
 +  /**
-+   * Transformer events (storm, recovered, resumed, dropping, engaged, first-pass, key-expired, key-evicted). Called
-+   * on a WebRTC media thread: return quickly, hand the event to your own thread.
++   * Transformer events (storm, recovered, resumed, dropping, engaged, first-pass, key-expired, key-evicted, held,
++   * released). Called on a WebRTC media thread: return quickly, hand the event to your own thread. {@code count} =
++   * the frames released (type {@code released}), else 0.
 +   */
 +  public interface Observer {
 +    @CalledByNative("Observer")
-+    void onSFrameEvent(String type, String streamId, String reason, long kid, long consecutive);
++    void onSFrameEvent(String type, String streamId, String reason, long kid, long consecutive, long count);
 +  }
 +
 +  private long nativeKeyStore;
@@ -3880,6 +4334,15 @@ index 0000000..37b0d5d
 +    nativeSetH264Enabled(nativeKeyStore, enabled);
 +  }
 +
++  /**
++   * C-24 (spec §9.2 [0.3]): how long a receive VIDEO stream holds frames of a known leg's next epoch(s) while their
++   * key is missing (default 10 s = the retention default); 0 turns holding off (such frames drop as unknown-kid).
++   */
++  public void setHoldTime(long holdMs) {
++    checkExists();
++    nativeSetHoldTime(nativeKeyStore, holdMs);
++  }
++
 +  public void setObserver(@Nullable Observer observer) {
 +    checkExists();
 +    nativeSetObserver(nativeKeyStore, observer);
@@ -3928,6 +4391,7 @@ index 0000000..37b0d5d
 +  private static native long nativeGetSendKid(long keyStore);
 +  private static native void nativeSetStormThreshold(long keyStore, int n);
 +  private static native void nativeSetH264Enabled(long keyStore, boolean enabled);
++  private static native void nativeSetHoldTime(long keyStore, long holdMs);
 +  private static native void nativeSetObserver(long keyStore, @Nullable Observer observer);
 +  private static native String nativeGetStatsJson(long keyStore);
 +  @Nullable
@@ -3937,10 +4401,10 @@ index 0000000..37b0d5d
 +}
 diff --git a/sdk/android/src/jni/pc/sframe_cryptor.cc b/sdk/android/src/jni/pc/sframe_cryptor.cc
 new file mode 100644
-index 0000000..37f8e44
+index 0000000..baad247
 --- /dev/null
 +++ b/sdk/android/src/jni/pc/sframe_cryptor.cc
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,321 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — JNI for org.webrtc.SFrameKeyStore and
 + * org.webrtc.SFrameCryptor. No key byte crosses back to Java and none is
@@ -3985,7 +4449,7 @@ index 0000000..37f8e44
 +        env, j_observer_, NativeToJavaString(env, SframeEventTypeName(e.type)),
 +        NativeToJavaString(env, e.stream_id), NativeToJavaString(env, reason),
 +        e.kid ? static_cast<jlong>(*e.kid) : -1,
-+        static_cast<jlong>(e.consecutive));
++        static_cast<jlong>(e.consecutive), static_cast<jlong>(e.count));
 +  }
 +
 + private:
@@ -4046,6 +4510,9 @@ index 0000000..37f8e44
 +  j += ",\"consecutive\":" + std::to_string(s.consecutive);
 +  j += ",\"storm\":" + std::string(s.storm ? "true" : "false");
 +  j += ",\"storms\":" + std::to_string(s.storms);
++  j += ",\"held\":" + std::to_string(s.held);
++  j += ",\"heldReleased\":" + std::to_string(s.held_released);
++  j += ",\"heldNow\":" + std::to_string(s.held_now);
 +  j += ",\"lastKid\":" +
 +       (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
 +  j += ",\"firstFrameAtMs\":" + (s.first_frame_at
@@ -4130,6 +4597,12 @@ index 0000000..37f8e44
 +                                              jlong j_store,
 +                                              jboolean j_enabled) {
 +  Store(j_store)->SetH264Enabled(j_enabled);
++}
++
++static void JNI_SFrameKeyStore_SetHoldTime(JNIEnv* env,
++                                           jlong j_store,
++                                           jlong j_hold_ms) {
++  Store(j_store)->SetHoldTime(TimeDelta::Millis(std::max<jlong>(0, j_hold_ms)));
 +}
 +
 +static void JNI_SFrameKeyStore_SetObserver(
@@ -4425,10 +4898,10 @@ index 0000000..0effb40
 +NS_ASSUME_NONNULL_END
 diff --git a/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h
 new file mode 100644
-index 0000000..935792c
+index 0000000..0066de9
 --- /dev/null
 +++ b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,113 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the iOS/macOS API of the RFC 9605
 + * SFrame transformer (api/crypto/sframe_transformer.h). Twin of the Android
@@ -4469,8 +4942,9 @@ index 0000000..935792c
 +
 +/**
 + * Transformer events (engaged, first-pass, dropping, storm, recovered, resumed,
-+ * key-expired, key-evicted). Called on a WebRTC media thread with no lock held:
-+ * return quickly, hand the event to your own queue.
++ * key-expired, key-evicted, held, released). Called on a WebRTC media thread
++ * with no lock held: return quickly, hand the event to your own queue. `count`
++ * = the frames released (type `released`), else 0.
 + */
 +RTC_OBJC_EXPORT
 +@protocol RTC_OBJC_TYPE(RTCSFrameKeyStoreDelegate)<NSObject>
@@ -4479,7 +4953,8 @@ index 0000000..935792c
 +              streamId:(NSString *)streamId
 +                reason:(NSString *)reason
 +                   kid:(int64_t)kid
-+           consecutive:(int64_t)consecutive;
++           consecutive:(int64_t)consecutive
++                 count:(int64_t)count;
 +@end
 +
 +/** The keys of one call; shared by every RTCSFrameCryptor of that call. */
@@ -4507,6 +4982,12 @@ index 0000000..935792c
 +- (int64_t)sendKid;
 +
 +- (void)setStormThreshold:(int)threshold;
++
++/**
++ * C-24 (spec §9.2 [0.3]): how long a receive VIDEO stream holds frames of a known leg's next epoch(s) while their
++ * key is missing (default 10 s = the retention default); 0 turns holding off (such frames drop as unknown-kid).
++ */
++- (void)setHoldTimeMs:(int64_t)holdMs;
 +
 +/** H.264 units (spec §9.2 fallback layout). Off by default: H.264 frames are dropped. */
 +- (void)setH264Enabled:(BOOL)enabled;
@@ -4536,10 +5017,10 @@ index 0000000..935792c
 +NS_ASSUME_NONNULL_END
 diff --git a/sdk/objc/api/peerconnection/RTCSFrameKeyStore.mm b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.mm
 new file mode 100644
-index 0000000..8e45a40
+index 0000000..9a2493b
 --- /dev/null
 +++ b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.mm
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,250 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — RTCSFrameKeyStore over
 + * webrtc::SframeKeyStore. No key byte crosses back to Objective-C and none is
@@ -4585,7 +5066,8 @@ index 0000000..8e45a40
 +                    streamId:[NSString stringForStdString:e.stream_id]
 +                      reason:[NSString stringWithUTF8String:reason]
 +                         kid:e.kid ? static_cast<int64_t>(*e.kid) : -1
-+                 consecutive:static_cast<int64_t>(e.consecutive)];
++                 consecutive:static_cast<int64_t>(e.consecutive)
++                       count:static_cast<int64_t>(e.count)];
 +  }
 +
 + private:
@@ -4652,6 +5134,9 @@ index 0000000..8e45a40
 +  j += ",\"consecutive\":" + std::to_string(s.consecutive);
 +  j += ",\"storm\":" + std::string(s.storm ? "true" : "false");
 +  j += ",\"storms\":" + std::to_string(s.storms);
++  j += ",\"held\":" + std::to_string(s.held);
++  j += ",\"heldReleased\":" + std::to_string(s.held_released);
++  j += ",\"heldNow\":" + std::to_string(s.held_now);
 +  j += ",\"lastKid\":" + (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
 +  j += ",\"firstFrameAtMs\":" + OptionalMs(s.first_frame_at);
 +  j += ",\"firstPassAtMs\":" + OptionalMs(s.first_pass_at);
@@ -4730,6 +5215,10 @@ index 0000000..8e45a40
 +
 +- (void)setStormThreshold:(int)threshold {
 +  _nativeKeyStore->SetStormThreshold(threshold);
++}
++
++- (void)setHoldTimeMs:(int64_t)holdMs {
++  _nativeKeyStore->SetHoldTime(webrtc::TimeDelta::Millis(holdMs < 0 ? 0 : holdMs));
 +}
 +
 +- (void)setH264Enabled:(BOOL)enabled {
