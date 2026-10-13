@@ -4748,7 +4748,7 @@ index 161c861..f7f97ce 100644
      return WebRtcAudioEffects.isAcousticEchoCancelerSupported();
    }
 diff --git a/sdk/android/src/java/org/webrtc/audio/WebRtcAudioRecord.java b/sdk/android/src/java/org/webrtc/audio/WebRtcAudioRecord.java
-index b5ffd50..33e69e0 100644
+index b5ffd50..11ca5cb 100644
 --- a/sdk/android/src/java/org/webrtc/audio/WebRtcAudioRecord.java
 +++ b/sdk/android/src/java/org/webrtc/audio/WebRtcAudioRecord.java
 @@ -19,6 +19,7 @@ import android.media.AudioRecord;
@@ -4784,7 +4784,7 @@ index b5ffd50..33e69e0 100644
 +      if (preferMicrophoneTowardsUser && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
 +        try {
 +          boolean ok = audioRecord.setPreferredMicrophoneDirection(MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER);
-+          Logging.d(TAG, "tkm C-25: setPreferredMicrophoneDirection(TOWARDS_USER) = " + ok);
++          Logging.w(TAG, "tkm C-25: setPreferredMicrophoneDirection(TOWARDS_USER) = " + ok); // warn: visible in release logcat
 +        } catch (RuntimeException e) {
 +          Logging.w(TAG, "tkm C-25: setPreferredMicrophoneDirection failed: " + e.getMessage());
 +        }
