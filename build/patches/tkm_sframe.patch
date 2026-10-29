@@ -1433,10 +1433,10 @@ index 0000000..8e1bdc1
 +};
 diff --git a/api/crypto/sframe_transformer.cc b/api/crypto/sframe_transformer.cc
 new file mode 100644
-index 0000000..9f5a60a
+index 0000000..12c51ce
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.cc
-@@ -0,0 +1,1175 @@
+@@ -0,0 +1,1301 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame frame transformer. See
 + * sframe_transformer.h.
@@ -1560,6 +1560,10 @@ index 0000000..9f5a60a
 +      return "held-expired";
 +    case SframeDropReason::kHeldOverflow:
 +      return "held-overflow";
++    case SframeDropReason::kUnbound:
++      return "unbound";
++    case SframeDropReason::kWrongLeg:
++      return "wrong-leg";
 +    case SframeDropReason::kCount:
 +      break;
 +  }
@@ -1571,13 +1575,17 @@ index 0000000..9f5a60a
 +  // 'short') + H.264 'malformed'.
 +  // C-24: a held frame whose key never came (or that overflowed the hold) is
 +  // an unknown-kid drop that waited.
++  // S-7 (ruling Q3): a frame this stream may not open (unbound, another leg's
++  // KID) is undecryptable for it — it counts.
 +  return reason == SframeDropReason::kBadTag ||
 +         reason == SframeDropReason::kUnknownKid ||
 +         reason == SframeDropReason::kBadHeader ||
 +         reason == SframeDropReason::kShort ||
 +         reason == SframeDropReason::kMalformed ||
 +         reason == SframeDropReason::kHeldExpired ||
-+         reason == SframeDropReason::kHeldOverflow;
++         reason == SframeDropReason::kHeldOverflow ||
++         reason == SframeDropReason::kUnbound ||
++         reason == SframeDropReason::kWrongLeg;
 +}
 +
 +const char* SframeEventTypeName(SframeEvent::Type type) {
@@ -1804,6 +1812,101 @@ index 0000000..9f5a60a
 +void SframeKeyStore::SetH264Enabled(bool enabled) {
 +  MutexLock lock(&mutex_);
 +  h264_enabled_ = enabled;
++}
++
++void SframeKeyStore::SetRequireLegBinding(bool required) {
++  MutexLock lock(&mutex_);
++  require_leg_binding_ = required;
++}
++
++bool SframeKeyStore::require_leg_binding() const {
++  MutexLock lock(&mutex_);
++  return require_leg_binding_;
++}
++
++bool SframeKeyStore::BindLeg(const std::string& stream_id,
++                             std::optional<uint32_t> leg_index) {
++  Events events;
++  bool found = false;
++  {
++    MutexLock lock(&mutex_);
++    for (auto& s : streams_) {
++      if (s->stats.role == SframeRole::kReceiver &&
++          s->stats.stream_id == stream_id) {
++        if (!BindLegLocked(s.get(), leg_index, &events)) {
++          return false;
++        }
++        found = true;
++      }
++    }
++  }
++  Dispatch(events);
++  return found;
++}
++
++bool SframeKeyStore::BindStreamLeg(Stream* stream,
++                                   std::optional<uint32_t> leg_index) {
++  Events events;
++  bool ok;
++  {
++    MutexLock lock(&mutex_);
++    ok = BindLegLocked(stream, leg_index, &events);
++  }
++  Dispatch(events);
++  return ok;
++}
++
++bool SframeKeyStore::BindLegLocked(Stream* stream,
++                                   std::optional<uint32_t> leg_index,
++                                   Events* events) {
++  if (stream->stats.role != SframeRole::kReceiver ||
++      (leg_index && (*leg_index == 0 || *leg_index > 0xFFFF))) {
++    return false;
++  }
++  SframeStreamStats& st = stream->stats;
++  if (st.bound_leg == leg_index) {
++    return true;  // re-bound to the same leg (every roster change): no-op
++  }
++  st.bound_leg = leg_index;
++  // Frames held under the old binding (C-24) are not known to be the new
++  // leg's: they go, counted as wrong-leg (outside the storm count, which
++  // restarts below).
++  while (!stream->held.empty()) {
++    stream->held_bytes -= stream->held.front().bytes;
++    st.held_now--;
++    st.dropped[static_cast<size_t>(SframeDropReason::kWrongLeg)]++;
++    stream->held.pop_front();
++  }
++  // The drops before this binding (unbound / another leg) say nothing about
++  // the new leg: a fresh storm count.
++  if (st.storm) {
++    SframeEvent e;
++    e.type = SframeEvent::Type::kResumed;
++    e.stream_id = st.stream_id;
++    e.role = st.role;
++    e.kind = st.kind;
++    events->push_back(e);
++  }
++  st.storm = false;
++  st.consecutive = 0;
++  return true;
++}
++
++std::optional<SframeDropReason> SframeKeyStore::LegCheckLocked(
++    const Stream* stream,
++    uint64_t kid) const {
++  const std::optional<uint32_t>& bound = stream->stats.bound_leg;
++  if (!bound) {
++    // S-7 / Q1: a store that requires the binding opens nothing for an
++    // unbound stream (the participant is not known to be in the verified
++    // roster yet, or left it).
++    return require_leg_binding_ ? std::optional(SframeDropReason::kUnbound)
++                                : std::nullopt;
++  }
++  if (sframe::LegIndexOf(kid) != *bound) {
++    return SframeDropReason::kWrongLeg;
++  }
++  return std::nullopt;
 +}
 +
 +std::vector<uint8_t> SframeKeyStore::VectorSeal(
@@ -2126,6 +2229,11 @@ index 0000000..9f5a60a
 +    return false;
 +  }
 +  const uint32_t leg = sframe::LegIndexOf(kid);
++  // S-7: a bound stream holds only for its own leg (a frame of another leg
++  // never reaches here: OpenLocked drops it wrong-leg first).
++  if (stream->stats.bound_leg && *stream->stats.bound_leg != leg) {
++    return false;
++  }
 +  for (const auto& [k, e] : keys_) {
 +    if (sframe::LegIndexOf(k) != leg) {
 +      continue;
@@ -2395,6 +2503,15 @@ index 0000000..9f5a60a
 +      *why = SframeDropReason::kBadHeader;
 +      return false;
 +    }
++    // S-7: the binding is checked BEFORE the key lookup and before last_kid
++    // (which drives the hold and the storm recovery) is written: a frame of
++    // another leg never touches a replay window, the hold or this stream's
++    // KID history.
++    if (const std::optional<SframeDropReason> leg =
++            LegCheckLocked(stream, h->kid)) {
++      *why = *leg;
++      return false;
++    }
 +    stream->stats.last_kid = h->kid;
 +    KeyEntry* entry = FindKeyLocked(h->kid);
 +    if (entry == nullptr) {
@@ -2469,6 +2586,11 @@ index 0000000..9f5a60a
 +    const std::optional<sframe::Header> h = sframe::ParseHeader(*unit);
 +    if (!h || unit->size() < h->length + sframe::kTagSize) {
 +      *why = h ? SframeDropReason::kShort : SframeDropReason::kBadHeader;
++      return false;
++    }
++    if (const std::optional<SframeDropReason> leg =
++            LegCheckLocked(stream, h->kid)) {
++      *why = *leg;  // S-7, as above
 +      return false;
 +    }
 +    stream->stats.last_kid = h->kid;
@@ -2551,6 +2673,10 @@ index 0000000..9f5a60a
 +  return store_->StatsOf(stream_);
 +}
 +
++bool SframeTransformer::BindLeg(std::optional<uint32_t> leg_index) {
++  return store_->BindStreamLeg(stream_, leg_index);
++}
++
 +scoped_refptr<TransformedFrameCallback> SframeTransformer::SinkFor(
 +    uint32_t ssrc) {
 +  MutexLock lock(&sink_mutex_);
@@ -2614,10 +2740,10 @@ index 0000000..9f5a60a
 +}  // namespace webrtc
 diff --git a/api/crypto/sframe_transformer.h b/api/crypto/sframe_transformer.h
 new file mode 100644
-index 0000000..2befe36
+index 0000000..ebfd40e
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.h
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,436 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame (RFC 9605) frame transformer
 + * of the native engine.
@@ -2638,6 +2764,9 @@ index 0000000..2befe36
 + * frames fail and are dropped);
 + *   - no default key, no implicit key fallback, no ratchet: a frame is opened
 + * only by the key of its own KID;
++ *   - leg binding (S-7): a receive stream bound to a leg opens only KIDs of
++ * that leg, and with require_leg_binding an unbound one opens nothing — the
++ * relay cannot route one member's frames under another participant's track;
 + *   - nonce = salt XOR CTR with a CTR per KID that never repeats within this
 + * key store's life;
 + *   - zero-length frames dropped; codecs other than Opus / VP8 (H.264 only when
@@ -2699,6 +2828,11 @@ index 0000000..2befe36
 +                  // epoch that never arrived within the hold time (C-24)
 +  kHeldOverflow,  // receiver (video): the hold queue was full; the oldest held
 +                  // frame was dropped (C-24)
++  kUnbound,       // receiver: the store requires a leg binding and this stream
++                  // has none yet (S-7, ruling Q1: fail closed)
++  kWrongLeg,      // receiver: the frame's KID belongs to another leg than the
++                  // one this stream is bound to (S-7: a relay re-routing a
++                  // member's frames under another participant's identity)
 +  kCount
 +};
 +RTC_EXPORT const char* SframeDropReasonName(SframeDropReason reason);
@@ -2724,6 +2858,10 @@ index 0000000..2befe36
 +  uint64_t held = 0;           // frames that entered the hold
 +  uint64_t held_released = 0;  // of which opened and delivered when the key came
 +  uint64_t held_now = 0;       // currently held
++  // Receiver only (S-7): the leg_index this stream renders (the verified
++  // roster's index of the relay participant whose track it is), set by
++  // BindLeg; nullopt = unbound.
++  std::optional<uint32_t> bound_leg;
 +  std::optional<uint64_t> last_kid;
 +  std::optional<Timestamp> first_frame_at;
 +  std::optional<Timestamp> first_pass_at;
@@ -2840,6 +2978,22 @@ index 0000000..2befe36
 +  void SetObserver(scoped_refptr<SframeObserver> observer);
 +  std::vector<SframeStreamStats> GetAllStats() const;
 +
++  // S-7 (ruling Q1): when on, a receive stream opens frames ONLY after BindLeg
++  // gave it a leg, and only under KIDs of that leg (kid >> 16): unbound →
++  // drop kUnbound, another leg → drop kWrongLeg (both count toward the storm,
++  // ruling Q3). Off (the default, for the pre-tkm.9 callers): an unbound
++  // stream opens any installed KID, as before; a bound one is still filtered.
++  // Call once at creation, before frames flow.
++  void SetRequireLegBinding(bool required);
++  bool require_leg_binding() const;
++  // S-7: binds every receive stream labelled `stream_id` to `leg_index`
++  // (1..65535), or unbinds it (nullopt). A change of binding drops the frames
++  // that stream holds (C-24: they were held for the old leg) and resets its
++  // storm state (kResumed if it was stormed): the drops before the binding
++  // are not the new leg's fault. False if no receive stream has that label or
++  // `leg_index` is not assignable (0 or > 0xFFFF).
++  bool BindLeg(const std::string& stream_id, std::optional<uint32_t> leg_index);
++
 +  // Must be called once before frames flow: enables H.264 (spec §9.2 [0.2]
 +  // fallback layout). Default OFF: H.264 is dropped like any other codec until
 +  // the layout is fixed by test (a) on the fork (OPEN H-1 of the M1 report).
@@ -2908,6 +3062,14 @@ index 0000000..2befe36
 +  // recovery of the receiver).
 +  void PassLocked(Stream* stream, uint64_t kid, size_t out_bytes, Events* events)
 +      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  // S-7: nullopt when the stream may open `kid`, else kUnbound / kWrongLeg.
++  std::optional<SframeDropReason> LegCheckLocked(const Stream* stream,
++                                                 uint64_t kid) const
++      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  bool BindStreamLeg(Stream* stream, std::optional<uint32_t> leg_index);
++  bool BindLegLocked(Stream* stream,
++                     std::optional<uint32_t> leg_index,
++                     Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 +  // C-24
 +  bool ShouldHoldLocked(const Stream* stream, uint64_t kid) const
 +      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -2955,6 +3117,7 @@ index 0000000..2befe36
 +  uint64_t install_seq_ RTC_GUARDED_BY(mutex_) = 0;
 +  int storm_threshold_ RTC_GUARDED_BY(mutex_) = kDefaultStormThreshold;
 +  bool h264_enabled_ RTC_GUARDED_BY(mutex_) = false;
++  bool require_leg_binding_ RTC_GUARDED_BY(mutex_) = false;  // S-7
 +  TimeDelta hold_time_ RTC_GUARDED_BY(mutex_) = TimeDelta::Millis(kDefaultHoldMs);
 +  std::vector<std::unique_ptr<Stream>> streams_ RTC_GUARDED_BY(mutex_);
 +  Mutex observer_mutex_;
@@ -2974,6 +3137,10 @@ index 0000000..2befe36
 +      const std::string& stream_id);
 +
 +  SframeStreamStats GetStats() const;
++  // S-7: binds this (receive) transformer to `leg_index`, or unbinds it
++  // (nullopt); see SframeKeyStore::BindLeg. False on a sender or an
++  // unassignable leg index.
++  bool BindLeg(std::optional<uint32_t> leg_index);
 +  SframeRole role() const { return role_; }
 +  SframeMediaKind kind() const { return kind_; }
 +  const scoped_refptr<SframeKeyStore>& key_store() const { return store_; }
@@ -3015,10 +3182,10 @@ index 0000000..2befe36
 +#endif  // API_CRYPTO_SFRAME_TRANSFORMER_H_
 diff --git a/api/crypto/sframe_transformer_unittest.cc b/api/crypto/sframe_transformer_unittest.cc
 new file mode 100644
-index 0000000..0d91dab
+index 0000000..2ac2e9a
 --- /dev/null
 +++ b/api/crypto/sframe_transformer_unittest.cc
-@@ -0,0 +1,1064 @@
+@@ -0,0 +1,1242 @@
 +/*
 + * C182 / DR-055 — the SFrame transformer: our vectors through the
 + * FrameTransformerInterface, the fail-closed negative controls (CM-1, CM-2,
@@ -4081,6 +4248,184 @@ index 0000000..0d91dab
 +  EXPECT_EQ(rv->GetStats().held_now, 0u);
 +}
 +
++// ---- S-7: leg binding (a relay participant ↔ the KIDs of its frames)
++// ----------------------------------------------------------------------------
++
++// Alice is leg 1, Carol leg 2; Bob holds both keys (one store per call). Bob's
++// receive stream for Alice's track, bound to leg 1, opens Alice's frames and
++// drops Carol's as wrong-leg — the relay cannot route Carol's media under
++// Alice's identity. A wrong-leg frame touches nothing: no replay window (the
++// same unit still opens on Carol's own stream), no last_kid.
++TEST(SframeTransformer, BoundReceiverOpensOnlyItsOwnLegsKids) {
++  Leg alice, carol, bob;
++  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
++  ASSERT_EQ(alice.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kid(1, 4)));
++  ASSERT_EQ(carol.store->SetKey(kid(2, 4), OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(carol.store->SetSendKid(kid(2, 4)));
++  ASSERT_EQ(bob.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_EQ(bob.store->SetKey(kid(2, 4), OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
++  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
++  auto sc = carol.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sc");
++  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "recv:audio:alice");
++  auto rc = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "recv:audio:carol");
++  sa->Transform(AudioFrame({0x78, 1, 1}, Direction::kSender));
++  sc->Transform(AudioFrame({0x78, 2, 2}, Direction::kSender));
++  const std::vector<uint8_t> from_alice = alice.sinks["sa"]->frames.back();
++  const std::vector<uint8_t> from_carol = carol.sinks["sc"]->frames.back();
++
++  ASSERT_TRUE(bob.store->BindLeg("recv:audio:alice", 1));
++  EXPECT_EQ(ra->GetStats().bound_leg, std::optional<uint32_t>(1));
++  ra->Transform(AudioFrame(from_carol, Direction::kReceiver));  // re-routed
++  SframeStreamStats st = ra->GetStats();
++  EXPECT_EQ(Dropped(st, SframeDropReason::kWrongLeg), 1u);
++  EXPECT_EQ(st.passed, 0u);
++  EXPECT_FALSE(st.last_kid.has_value()) << "a wrong-leg KID is not this stream's history";
++  EXPECT_EQ(st.consecutive, 1u) << "Q3: wrong-leg counts toward the storm";
++  ASSERT_EQ(st.drop_samples.size(), 1u);
++  EXPECT_EQ(st.drop_samples[0].rfind("wrong-leg len=", 0), 0u);
++  ra->Transform(AudioFrame(from_alice, Direction::kReceiver));
++  EXPECT_EQ(bob.sinks["recv:audio:alice"]->frames.size(), 1u);
++  EXPECT_EQ(ra->GetStats().consecutive, 0u);
++  // Carol's unit never reached the replay window: it still opens where it
++  // belongs (rc bound to leg 2 through the transformer API).
++  ASSERT_TRUE(rc->BindLeg(2));
++  rc->Transform(AudioFrame(from_carol, Direction::kReceiver));
++  EXPECT_EQ(bob.sinks["recv:audio:carol"]->frames.size(), 1u);
++  EXPECT_EQ(Dropped(rc->GetStats(), SframeDropReason::kReplay), 0u);
++  // Without a binding and without require_leg_binding (the pre-tkm.9
++  // behaviour) any installed KID opens: the filter is the binding.
++  auto rx = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "rx");
++  sc->Transform(AudioFrame({0x78, 3}, Direction::kSender));
++  rx->Transform(AudioFrame(carol.sinks["sc"]->frames.back(), Direction::kReceiver));
++  EXPECT_EQ(bob.sinks["rx"]->frames.size(), 1u);
++}
++
++// Q1: with require_leg_binding an unbound receive stream opens NOTHING (the
++// participant is not, or no longer, in the verified roster) — 'unbound', and
++// it counts toward the storm (Q3). Binding resumes a stormed stream with a
++// fresh count; unbinding closes it again. BindLeg refuses unknown streams,
++// senders and reserved leg indexes.
++TEST(SframeTransformer, RequiredBindingDropsUnboundFramesUntilBound) {
++  Leg alice, bob;
++  bob.store->SetRequireLegBinding(true);
++  EXPECT_TRUE(bob.store->require_leg_binding());
++  ASSERT_EQ(alice.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
++  ASSERT_EQ(bob.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
++  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
++  auto& sent = alice.sinks["sv"]->frames;
++  auto& got = bob.sinks["rv"]->frames;
++  for (int i = 0; i < SframeKeyStore::kDefaultStormThreshold; ++i) {
++    sv->Transform(VideoFrame({0x10, static_cast<uint8_t>(i)}, Direction::kSender));
++    rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
++  }
++  SframeStreamStats st = rv->GetStats();
++  EXPECT_TRUE(got.empty()) << "Q1: an unbound receiver never opens";
++  EXPECT_EQ(Dropped(st, SframeDropReason::kUnbound),
++            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold));
++  EXPECT_TRUE(st.storm) << "Q3: unbound drops count toward the storm";
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kStorm, "rv"), 1);
++  EXPECT_EQ(st.held_now, 0u) << "an unbound stream holds nothing";
++
++  EXPECT_FALSE(bob.store->BindLeg("nope", 1));
++  EXPECT_FALSE(bob.store->BindLeg("rv", 0)) << "leg_index 0 is reserved";
++  EXPECT_FALSE(bob.store->BindLeg("rv", 0x10000));
++  EXPECT_FALSE(sv->BindLeg(1)) << "a sender has no leg to bind";
++  EXPECT_FALSE(rv->GetStats().bound_leg.has_value());
++
++  ASSERT_TRUE(bob.store->BindLeg("rv", 1));
++  st = rv->GetStats();
++  EXPECT_FALSE(st.storm);
++  EXPECT_EQ(st.consecutive, 0u);
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "rv"), 1);
++  sv->Transform(VideoFrame({0x10, 0x55}, Direction::kSender));
++  rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
++  ASSERT_EQ(got.size(), 1u);
++  EXPECT_EQ(got[0], std::vector<uint8_t>({0x10, 0x55}));
++  ASSERT_TRUE(bob.store->BindLeg("rv", 1));  // the same leg again: a no-op
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "rv"), 1);
++
++  // The participant leaves the verified roster: unbound again, nothing opens.
++  ASSERT_TRUE(bob.store->BindLeg("rv", std::nullopt));
++  sv->Transform(VideoFrame({0x10, 0x56}, Direction::kSender));
++  rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
++  EXPECT_EQ(got.size(), 1u);
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnbound),
++            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold) + 1);
++}
++
++// C-24 × S-7: a bound stream holds only for ITS leg's next epoch; the next
++// epoch of another known leg drops wrong-leg at once. A rebind drops what was
++// held for the old leg.
++TEST(SframeTransformer, BoundStreamHoldsOnlyForItsOwnLeg) {
++  Leg alice, bob;
++  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
++  ASSERT_EQ(bob.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_EQ(bob.store->SetKey(kid(2, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
++  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
++  ASSERT_TRUE(rv->BindLeg(1));
++  auto seal = [&](uint64_t k) {
++    ASSERT_NE(alice.store->SetKey(k, kBase), SframeKeyStore::SetKeyResult::kInvalid);
++    ASSERT_TRUE(alice.store->SetSendKid(k));
++    sv->Transform(VideoFrame({0x10, 1, 2}, Direction::kSender));
++    rv->Transform(VideoFrame(alice.sinks["sv"]->frames.back(), Direction::kReceiver));
++  };
++  seal(kid(1, 5));  // its own leg's next epoch: held
++  EXPECT_EQ(rv->GetStats().held_now, 1u);
++  seal(kid(2, 5));  // a known leg's next epoch, but not this stream's
++  SframeStreamStats st = rv->GetStats();
++  EXPECT_EQ(st.held_now, 1u);
++  EXPECT_EQ(Dropped(st, SframeDropReason::kWrongLeg), 1u);
++  EXPECT_EQ(st.consecutive, 1u);
++  // rebind to leg 2: the frame held for leg 1 goes, the count restarts
++  ASSERT_TRUE(rv->BindLeg(2));
++  st = rv->GetStats();
++  EXPECT_EQ(st.held_now, 0u);
++  EXPECT_EQ(Dropped(st, SframeDropReason::kWrongLeg), 2u);
++  EXPECT_EQ(st.consecutive, 0u);
++  ASSERT_EQ(bob.store->SetKey(kid(1, 5), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  EXPECT_TRUE(bob.sinks["rv"]->frames.empty()) << "nothing of leg 1 is released into a leg-2 stream";
++  EXPECT_EQ(rv->GetStats().held_released, 0u);
++}
++
++// H.264 units are filtered the same way (the leg check runs per slice, before
++// the key lookup).
++TEST(SframeTransformer, H264UnitsOfAnotherLegAreDroppedWrongLeg) {
++  Leg alice, bob;
++  alice.store->SetH264Enabled(true);
++  bob.store->SetH264Enabled(true);
++  bob.store->SetRequireLegBinding(true);
++  ASSERT_EQ(alice.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
++  ASSERT_EQ(bob.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
++  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
++  const std::vector<uint8_t> idr =
++      AnnexB({kSps, kPps, Slice({0x65, 0x88, 0x84}, 300, 7)});
++  sv->Transform(VideoFrame(idr, Direction::kSender, "video/H264"));
++  ASSERT_EQ(alice.sinks["sv"]->frames.size(), 1u);
++  const std::vector<uint8_t> unit = alice.sinks["sv"]->frames[0];
++  rv->Transform(VideoFrame(unit, Direction::kReceiver, "video/H264"));
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnbound), 1u);
++  ASSERT_TRUE(rv->BindLeg(2));
++  rv->Transform(VideoFrame(unit, Direction::kReceiver, "video/H264"));
++  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kWrongLeg), 1u);
++  ASSERT_TRUE(rv->BindLeg(1));
++  rv->Transform(VideoFrame(unit, Direction::kReceiver, "video/H264"));
++  ASSERT_EQ(bob.sinks["rv"]->frames.size(), 1u);
++  EXPECT_EQ(bob.sinks["rv"]->frames[0], idr);
++}
++
++TEST(SframeTransformer, LegBindingDropReasonNames) {
++  EXPECT_STREQ(SframeDropReasonName(SframeDropReason::kUnbound), "unbound");
++  EXPECT_STREQ(SframeDropReasonName(SframeDropReason::kWrongLeg), "wrong-leg");
++  EXPECT_TRUE(SframeDropCountsForStorm(SframeDropReason::kUnbound));
++  EXPECT_TRUE(SframeDropCountsForStorm(SframeDropReason::kWrongLeg));
++}
++
 +}  // namespace
 +}  // namespace webrtc
 diff --git a/media/engine/audio_processing_controller.cc b/media/engine/audio_processing_controller.cc
@@ -4494,10 +4839,10 @@ index 78d42bb..7b44ee9 100644
 +}
 diff --git a/sdk/android/api/org/webrtc/SFrameCryptor.java b/sdk/android/api/org/webrtc/SFrameCryptor.java
 new file mode 100644
-index 0000000..4861466
+index 0000000..dbc0c42
 --- /dev/null
 +++ b/sdk/android/api/org/webrtc/SFrameCryptor.java
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,72 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055).
 + *
@@ -4541,6 +4886,15 @@ index 0000000..4861466
 +  }
 +
 +  /**
++   * S-7: binds this receive transformer to {@code legIndex} (1..65535) or unbinds it ({@code legIndex} &lt; 0); see
++   * {@link SFrameKeyStore#bindLeg}. False on a sender or a reserved index.
++   */
++  public boolean bindLeg(int legIndex) {
++    checkExists();
++    return nativeBindLeg(nativeCryptor, legIndex);
++  }
++
++  /**
 +   * Releases the Java handle. The transformer stays attached to its sender/receiver (WebRTC keeps a reference) and
 +   * keeps sealing/opening with its key store: disposing never turns encryption off.
 +   */
@@ -4559,13 +4913,14 @@ index 0000000..4861466
 +  private static native long nativeCreateForRtpSender(long rtpSender, long keyStore, int kind, String streamId);
 +  private static native long nativeCreateForRtpReceiver(long rtpReceiver, long keyStore, int kind, String streamId);
 +  private static native String nativeGetStatsJson(long cryptor);
++  private static native boolean nativeBindLeg(long cryptor, int legIndex);
 +}
 diff --git a/sdk/android/api/org/webrtc/SFrameKeyStore.java b/sdk/android/api/org/webrtc/SFrameKeyStore.java
 new file mode 100644
-index 0000000..230704d
+index 0000000..5b23a3e
 --- /dev/null
 +++ b/sdk/android/api/org/webrtc/SFrameKeyStore.java
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,183 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055).
 + *
@@ -4671,6 +5026,26 @@ index 0000000..230704d
 +    nativeSetHoldTime(nativeKeyStore, holdMs);
 +  }
 +
++  /**
++   * S-7 (ruling Q1): when on, a receive stream opens frames only after {@link #bindLeg} gave it a leg, and only under
++   * KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). Off by
++   * default (the pre-tkm.9 behaviour). Set once, at creation, before frames flow.
++   */
++  public void setRequireLegBinding(boolean required) {
++    checkExists();
++    nativeSetRequireLegBinding(nativeKeyStore, required);
++  }
++
++  /**
++   * S-7: binds every receive stream labelled {@code streamId} to {@code legIndex} (1..65535), or unbinds it
++   * ({@code legIndex} &lt; 0). A change drops the frames the stream holds and restarts its storm count. False if no
++   * receive stream has that label or the index is reserved.
++   */
++  public boolean bindLeg(String streamId, int legIndex) {
++    checkExists();
++    return nativeBindLeg(nativeKeyStore, streamId, legIndex);
++  }
++
 +  public void setObserver(@Nullable Observer observer) {
 +    checkExists();
 +    nativeSetObserver(nativeKeyStore, observer);
@@ -4720,6 +5095,8 @@ index 0000000..230704d
 +  private static native void nativeSetStormThreshold(long keyStore, int n);
 +  private static native void nativeSetH264Enabled(long keyStore, boolean enabled);
 +  private static native void nativeSetHoldTime(long keyStore, long holdMs);
++  private static native void nativeSetRequireLegBinding(long keyStore, boolean required);
++  private static native boolean nativeBindLeg(long keyStore, String streamId, int legIndex);
 +  private static native void nativeSetObserver(long keyStore, @Nullable Observer observer);
 +  private static native String nativeGetStatsJson(long keyStore);
 +  @Nullable
@@ -5127,10 +5504,10 @@ index 119144e..f71ed21 100644
 +}  // namespace webrtc
 diff --git a/sdk/android/src/jni/pc/sframe_cryptor.cc b/sdk/android/src/jni/pc/sframe_cryptor.cc
 new file mode 100644
-index 0000000..baad247
+index 0000000..e85660c
 --- /dev/null
 +++ b/sdk/android/src/jni/pc/sframe_cryptor.cc
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,355 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — JNI for org.webrtc.SFrameKeyStore and
 + * org.webrtc.SFrameCryptor. No key byte crosses back to Java and none is
@@ -5239,6 +5616,8 @@ index 0000000..baad247
 +  j += ",\"held\":" + std::to_string(s.held);
 +  j += ",\"heldReleased\":" + std::to_string(s.held_released);
 +  j += ",\"heldNow\":" + std::to_string(s.held_now);
++  j += ",\"boundLeg\":" + (s.bound_leg ? std::to_string(*s.bound_leg)
++                                       : std::string("null"));  // S-7
 +  j += ",\"lastKid\":" +
 +       (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
 +  j += ",\"firstFrameAtMs\":" + (s.first_frame_at
@@ -5329,6 +5708,31 @@ index 0000000..baad247
 +                                           jlong j_store,
 +                                           jlong j_hold_ms) {
 +  Store(j_store)->SetHoldTime(TimeDelta::Millis(std::max<jlong>(0, j_hold_ms)));
++}
++
++static void JNI_SFrameKeyStore_SetRequireLegBinding(JNIEnv* env,
++                                                   jlong j_store,
++                                                   jboolean j_required) {
++  Store(j_store)->SetRequireLegBinding(j_required);
++}
++
++// S-7: legIndex < 0 = unbind.
++static std::optional<uint32_t> LegFromJava(jint j_leg_index) {
++  return j_leg_index < 0 ? std::nullopt
++                         : std::optional<uint32_t>(
++                               static_cast<uint32_t>(j_leg_index));
++}
++
++static jboolean JNI_SFrameKeyStore_BindLeg(
++    JNIEnv* env,
++    jlong j_store,
++    const JavaParamRef<jstring>& j_stream_id,
++    jint j_leg_index) {
++  if (j_stream_id.is_null()) {
++    return false;
++  }
++  return Store(j_store)->BindLeg(JavaToStdString(env, j_stream_id),
++                                 LegFromJava(j_leg_index));
 +}
 +
 +static void JNI_SFrameKeyStore_SetObserver(
@@ -5442,6 +5846,13 @@ index 0000000..baad247
 +  return jlongFromPointer(t.release());
 +}
 +
++static jboolean JNI_SFrameCryptor_BindLeg(JNIEnv* env,
++                                          jlong j_cryptor,
++                                          jint j_leg_index) {
++  return reinterpret_cast<SframeTransformer*>(j_cryptor)->BindLeg(
++      LegFromJava(j_leg_index));
++}
++
 +static ScopedJavaLocalRef<jstring> JNI_SFrameCryptor_GetStatsJson(
 +    JNIEnv* env,
 +    jlong j_cryptor) {
@@ -5454,10 +5865,10 @@ index 0000000..baad247
 +}  // namespace webrtc
 diff --git a/sdk/objc/api/peerconnection/RTCSFrameCryptor.h b/sdk/objc/api/peerconnection/RTCSFrameCryptor.h
 new file mode 100644
-index 0000000..ae37502
+index 0000000..0292268
 --- /dev/null
 +++ b/sdk/objc/api/peerconnection/RTCSFrameCryptor.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,52 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — attaches the RFC 9605 SFrame
 + * transformer of an RTCSFrameKeyStore to one RTCRtpSender (seals) or one
@@ -5498,6 +5909,12 @@ index 0000000..ae37502
 +                                   mediaKind:(RTCSFrameMediaKind)mediaKind
 +                                    streamId:(NSString *)streamId;
 +
++/**
++ * S-7: binds this receive transformer to `legIndex` (1..65535) or unbinds it (`legIndex` < 0); see
++ * -[RTCSFrameKeyStore bindLeg:streamId:]. NO on a sender or a reserved index.
++ */
++- (BOOL)bindLeg:(NSInteger)legIndex;
++
 +/** Counters of this stream as a JSON object. */
 +- (NSString *)statsJson;
 +
@@ -5506,10 +5923,10 @@ index 0000000..ae37502
 +NS_ASSUME_NONNULL_END
 diff --git a/sdk/objc/api/peerconnection/RTCSFrameCryptor.mm b/sdk/objc/api/peerconnection/RTCSFrameCryptor.mm
 new file mode 100644
-index 0000000..6443a85
+index 0000000..20d77b1
 --- /dev/null
 +++ b/sdk/objc/api/peerconnection/RTCSFrameCryptor.mm
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,85 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — RTCSFrameCryptor: one SframeTransformer
 + * attached to one RtpSender (seal) or RtpReceiver (open).
@@ -5584,6 +6001,12 @@ index 0000000..6443a85
 +  return self;
 +}
 +
++- (BOOL)bindLeg:(NSInteger)legIndex {
++  // S-7: legIndex < 0 = unbind
++  return _transformer->BindLeg(
++      legIndex < 0 ? std::nullopt : std::optional<uint32_t>(static_cast<uint32_t>(legIndex)));
++}
++
 +- (NSString *)statsJson {
 +  return [NSString stringForStdString:webrtc::RTCSFrameStatsJson(_transformer->GetStats())];
 +}
@@ -5624,10 +6047,10 @@ index 0000000..0effb40
 +NS_ASSUME_NONNULL_END
 diff --git a/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h
 new file mode 100644
-index 0000000..0066de9
+index 0000000..7b376d3
 --- /dev/null
 +++ b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,127 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the iOS/macOS API of the RFC 9605
 + * SFrame transformer (api/crypto/sframe_transformer.h). Twin of the Android
@@ -5718,6 +6141,20 @@ index 0000000..0066de9
 +/** H.264 units (spec §9.2 fallback layout). Off by default: H.264 frames are dropped. */
 +- (void)setH264Enabled:(BOOL)enabled;
 +
++/**
++ * S-7 (ruling Q1): when YES, a receive stream opens frames only after -bindLeg:streamId: gave it a leg, and only
++ * under KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). NO by
++ * default (the pre-tkm.9 behaviour). Set once, at creation, before frames flow.
++ */
++- (void)setRequireLegBinding:(BOOL)required;
++
++/**
++ * S-7: binds every receive stream labelled `streamId` to `legIndex` (1..65535), or unbinds it (`legIndex` < 0). A
++ * change drops the frames the stream holds and restarts its storm count. NO if no receive stream has that label or
++ * the index is reserved.
++ */
++- (BOOL)bindLeg:(NSInteger)legIndex streamId:(NSString *)streamId;
++
 +/** Counters of every live stream of this store, as a JSON array. */
 +- (NSString *)statsJson;
 +
@@ -5743,10 +6180,10 @@ index 0000000..0066de9
 +NS_ASSUME_NONNULL_END
 diff --git a/sdk/objc/api/peerconnection/RTCSFrameKeyStore.mm b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.mm
 new file mode 100644
-index 0000000..9a2493b
+index 0000000..8540b64
 --- /dev/null
 +++ b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.mm
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,265 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — RTCSFrameKeyStore over
 + * webrtc::SframeKeyStore. No key byte crosses back to Objective-C and none is
@@ -5863,6 +6300,7 @@ index 0000000..9a2493b
 +  j += ",\"held\":" + std::to_string(s.held);
 +  j += ",\"heldReleased\":" + std::to_string(s.held_released);
 +  j += ",\"heldNow\":" + std::to_string(s.held_now);
++  j += ",\"boundLeg\":" + (s.bound_leg ? std::to_string(*s.bound_leg) : std::string("null"));  // S-7
 +  j += ",\"lastKid\":" + (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
 +  j += ",\"firstFrameAtMs\":" + OptionalMs(s.first_frame_at);
 +  j += ",\"firstPassAtMs\":" + OptionalMs(s.first_pass_at);
@@ -5949,6 +6387,20 @@ index 0000000..9a2493b
 +
 +- (void)setH264Enabled:(BOOL)enabled {
 +  _nativeKeyStore->SetH264Enabled(enabled);
++}
++
++- (void)setRequireLegBinding:(BOOL)required {
++  _nativeKeyStore->SetRequireLegBinding(required);
++}
++
++- (BOOL)bindLeg:(NSInteger)legIndex streamId:(NSString *)streamId {
++  if (streamId == nil) {
++    return NO;
++  }
++  // S-7: legIndex < 0 = unbind
++  return _nativeKeyStore->BindLeg(
++      [streamId stdString],
++      legIndex < 0 ? std::nullopt : std::optional<uint32_t>(static_cast<uint32_t>(legIndex)));
 +}
 +
 +- (NSString *)statsJson {
