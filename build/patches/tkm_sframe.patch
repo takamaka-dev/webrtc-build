@@ -1433,10 +1433,10 @@ index 0000000..8e1bdc1
 +};
 diff --git a/api/crypto/sframe_transformer.cc b/api/crypto/sframe_transformer.cc
 new file mode 100644
-index 0000000..12c51ce
+index 0000000..6f7535f
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.cc
-@@ -0,0 +1,1301 @@
+@@ -0,0 +1,1338 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame frame transformer. See
 + * sframe_transformer.h.
@@ -1691,9 +1691,12 @@ index 0000000..12c51ce
 +      entry.expires_at.reset();
 +      result = SetKeyResult::kChanged;
 +      // spec §9.2 [0.2]: a key arriving resumes a stormed subscription; every
-+      // receive stream restarts its count.
++      // receive stream restarts its count — except an unbound stream that
++      // opens nothing (S-7): no key can recover it, only BindLeg, and a
++      // resumed / storm pair per epoch would flap the app's subscription.
 +      for (auto& s : streams_) {
-+        if (s->stats.role != SframeRole::kReceiver) {
++        if (s->stats.role != SframeRole::kReceiver ||
++            ClosedUnboundLocked(s.get())) {
 +          continue;
 +        }
 +        if (s->stats.storm) {
@@ -1816,7 +1819,9 @@ index 0000000..12c51ce
 +
 +void SframeKeyStore::SetRequireLegBinding(bool required) {
 +  MutexLock lock(&mutex_);
-+  require_leg_binding_ = required;
++  // One-way latch (tkm.10, R2): once required, always required. With the
++  // default on, `false` is never honoured.
++  require_leg_binding_ = require_leg_binding_ || required;
 +}
 +
 +bool SframeKeyStore::require_leg_binding() const {
@@ -1868,6 +1873,10 @@ index 0000000..12c51ce
 +    return true;  // re-bound to the same leg (every roster change): no-op
 +  }
 +  st.bound_leg = leg_index;
++  if (leg_index) {
++    stream->ever_bound = true;  // from now on unbound = closed, whatever the
++                                // store's flag says (tkm.10)
++  }
 +  // Frames held under the old binding (C-24) are not known to be the new
 +  // leg's: they go, counted as wrong-leg (outside the storm count, which
 +  // restarts below).
@@ -1899,14 +1908,25 @@ index 0000000..12c51ce
 +  if (!bound) {
 +    // S-7 / Q1: a store that requires the binding opens nothing for an
 +    // unbound stream (the participant is not known to be in the verified
-+    // roster yet, or left it).
-+    return require_leg_binding_ ? std::optional(SframeDropReason::kUnbound)
-+                                : std::nullopt;
++    // roster yet, or left it); nor does a stream that was bound once.
++    return ClosedUnboundLocked(stream)
++               ? std::optional(SframeDropReason::kUnbound)
++               : std::nullopt;
 +  }
-+  if (sframe::LegIndexOf(kid) != *bound) {
++  // The full 64-bit leg (kid >> 16), not LegIndexOf's 32-bit truncation: a
++  // wire KID of 2^48 or more (a leg index wider than 16 bits, which no key
++  // can ever carry) is nobody's leg, so it is wrong-leg — never an alias of
++  // the bound leg that goes on to the key lookup and into last_kid.
++  if (!sframe::IsAssignableKid(kid) || (kid >> 16) != uint64_t{*bound}) {
 +    return SframeDropReason::kWrongLeg;
 +  }
 +  return std::nullopt;
++}
++
++bool SframeKeyStore::ClosedUnboundLocked(const Stream* stream) const {
++  return stream->stats.role == SframeRole::kReceiver &&
++         !stream->stats.bound_leg &&
++         (require_leg_binding_ || stream->ever_bound);
 +}
 +
 +std::vector<uint8_t> SframeKeyStore::VectorSeal(
@@ -2042,7 +2062,7 @@ index 0000000..12c51ce
 +  MutexLock lock(&mutex_);
 +  stream->stats.frames++;
 +  stream->stats.bytes_in += bytes;
-+  DropLocked(stream, SframeDropReason::kNoSink, events);
++  DropLocked(stream, SframeDropReason::kNoSink, std::nullopt, events);
 +}
 +
 +SframeKeyStore::KeyEntry* SframeKeyStore::FindKeyLocked(uint64_t kid) {
@@ -2081,6 +2101,7 @@ index 0000000..12c51ce
 +
 +void SframeKeyStore::DropLocked(Stream* stream,
 +                                SframeDropReason why,
++                                std::optional<uint64_t> kid,
 +                                Events* events) {
 +  SframeStreamStats& st = stream->stats;
 +  st.dropped[static_cast<size_t>(why)]++;
@@ -2092,7 +2113,8 @@ index 0000000..12c51ce
 +    e.role = st.role;
 +    e.kind = st.kind;
 +    e.reason = why;
-+    e.kid = st.last_kid;
++    e.kid = kid;  // the dropped frame's, not last_kid (which an unbound /
++                  // wrong-leg frame never writes)
 +    events->push_back(e);
 +  }
 +  if (st.role != SframeRole::kReceiver || !SframeDropCountsForStorm(why)) {
@@ -2108,7 +2130,7 @@ index 0000000..12c51ce
 +    e.role = st.role;
 +    e.kind = st.kind;
 +    e.reason = why;
-+    e.kid = st.last_kid;
++    e.kid = kid;
 +    e.consecutive = st.consecutive;
 +    events->push_back(e);
 +  }
@@ -2148,15 +2170,21 @@ index 0000000..12c51ce
 +          ? TransformableFrameInterface::Direction::kSender
 +          : TransformableFrameInterface::Direction::kReceiver;
 +  if (frame.GetDirection() != expected) {
-+    DropLocked(stream, SframeDropReason::kInternal, events);
++    DropLocked(stream, SframeDropReason::kInternal, std::nullopt, events);
 +    SampleDrop(stream, SframeDropReason::kInternal, data);
 +    return false;
 +  }
 +  SframeDropReason why = SframeDropReason::kInternal;
-+  uint64_t kid = 0;
-+  const bool ok = st.role == SframeRole::kSender
-+                      ? SealLocked(stream, frame, out, &why)
-+                      : OpenLocked(stream, frame, out, &why, &kid);
++  // The frame's KID: the send KID, or the received header's once it was read
++  // (also when the frame then drops: the events carry it).
++  std::optional<uint64_t> kid;
++  bool ok;
++  if (st.role == SframeRole::kSender) {
++    kid = send_kid_;
++    ok = SealLocked(stream, frame, out, &why);
++  } else {
++    ok = OpenLocked(stream, frame, out, &why, &kid);
++  }
 +  if (!ok) {
 +    out->clear();
 +    if (why == SframeDropReason::kUnknownKid && st.last_kid &&
@@ -2167,11 +2195,12 @@ index 0000000..12c51ce
 +      *held = true;
 +      return false;
 +    }
-+    DropLocked(stream, why, events);
++    DropLocked(stream, why, kid, events);
 +    SampleDrop(stream, why, data);
 +    return false;
 +  }
-+  PassLocked(stream, kid, out->size(), events);
++  RTC_DCHECK(kid.has_value());
++  PassLocked(stream, *kid, out->size(), events);
 +  return true;
 +}
 +
@@ -2200,10 +2229,12 @@ index 0000000..12c51ce
 +    // receive stream whose last frames carried that KID (e.g. the paused video
 +    // of a leg whose audio now opens) may resume — spec §9.2 [0.2], the web
 +    // worker's recovered(): the fix may have been on the sender's side, so no
-+    // key event ever arrives here.
++    // key event ever arrives here. Not an unbound stream that opens nothing
++    // (S-7): only BindLeg brings it back (as in SetKey).
 +    for (auto& s : streams_) {
 +      if (s->stats.role == SframeRole::kReceiver && s->stats.storm &&
-+          (s.get() == stream || s->stats.last_kid == kid)) {
++          (s.get() == stream || s->stats.last_kid == kid) &&
++          !ClosedUnboundLocked(s.get())) {
 +        s->stats.storm = false;
 +        s->stats.consecutive = 0;
 +        SframeEvent e;
@@ -2259,7 +2290,7 @@ index 0000000..12c51ce
 +    HeldFrame& old = stream->held.front();
 +    stream->held_bytes -= old.bytes;
 +    st.held_now--;
-+    DropLocked(stream, SframeDropReason::kHeldOverflow, events);
++    DropLocked(stream, SframeDropReason::kHeldOverflow, old.kid, events);
 +    SampleDrop(stream, SframeDropReason::kHeldOverflow, old.frame->GetData());
 +    stream->held.pop_front();
 +  }
@@ -2302,10 +2333,10 @@ index 0000000..12c51ce
 +      s->stats.held_now--;
 +      std::vector<uint8_t> out;
 +      SframeDropReason why = SframeDropReason::kInternal;
-+      uint64_t opened_kid = 0;
++      std::optional<uint64_t> opened_kid;
 +      const bool ok = OpenLocked(s.get(), *h.frame, &out, &why, &opened_kid);
 +      if (!ok) {
-+        DropLocked(s.get(), why, events);
++        DropLocked(s.get(), why, h.kid, events);
 +        SampleDrop(s.get(), why, h.frame->GetData());
 +        continue;
 +      }
@@ -2313,11 +2344,11 @@ index 0000000..12c51ce
 +          s->transformer ? s->transformer->SinkFor(h.frame->GetSsrc())
 +                         : nullptr;
 +      if (!sink) {
-+        DropLocked(s.get(), SframeDropReason::kNoSink, events);
++        DropLocked(s.get(), SframeDropReason::kNoSink, h.kid, events);
 +        continue;
 +      }
 +      h.frame->SetData(out);
-+      PassLocked(s.get(), opened_kid, out.size(), events);
++      PassLocked(s.get(), opened_kid.value_or(h.kid), out.size(), events);
 +      s->stats.held_released++;
 +      released++;
 +      deliveries->push_back(Delivery{std::move(sink), std::move(h.frame)});
@@ -2344,7 +2375,7 @@ index 0000000..12c51ce
 +      HeldFrame& h = s->held.front();
 +      s->held_bytes -= h.bytes;
 +      s->stats.held_now--;
-+      DropLocked(s.get(), SframeDropReason::kHeldExpired, events);
++      DropLocked(s.get(), SframeDropReason::kHeldExpired, h.kid, events);
 +      SampleDrop(s.get(), SframeDropReason::kHeldExpired,
 +                 h.frame->GetData());
 +      s->held.pop_front();
@@ -2476,7 +2507,10 @@ index 0000000..12c51ce
 +                                const TransformableFrameInterface& frame,
 +                                std::vector<uint8_t>* out,
 +                                SframeDropReason* why,
-+                                uint64_t* kid_out) {
++                                std::optional<uint64_t>* kid_out) {
++  // `*kid_out` = the frame's KID from the moment a header was read, so a
++  // drop after that point (unbound, wrong-leg, unknown-kid, bad tag, ...)
++  // still names it in the events.
 +  const std::span<const uint8_t> data = frame.GetData();
 +  if (data.empty()) {
 +    // Padding-only RTP packets (bandwidth probing) reach the audio receive
@@ -2503,6 +2537,7 @@ index 0000000..12c51ce
 +      *why = SframeDropReason::kBadHeader;
 +      return false;
 +    }
++    *kid_out = h->kid;
 +    // S-7: the binding is checked BEFORE the key lookup and before last_kid
 +    // (which drives the hold and the storm recovery) is written: a frame of
 +    // another leg never touches a replay window, the hold or this stream's
@@ -2539,7 +2574,6 @@ index 0000000..12c51ce
 +      return false;
 +    }
 +    entry->window.Commit(h->ctr);  // only after the tag verified
-+    *kid_out = h->kid;
 +    return true;
 +  }
 +
@@ -2587,6 +2621,9 @@ index 0000000..12c51ce
 +    if (!h || unit->size() < h->length + sframe::kTagSize) {
 +      *why = h ? SframeDropReason::kShort : SframeDropReason::kBadHeader;
 +      return false;
++    }
++    if (!frame_kid) {
++      *kid_out = h->kid;  // the first sealed slice names the frame
 +    }
 +    if (const std::optional<SframeDropReason> leg =
 +            LegCheckLocked(stream, h->kid)) {
@@ -2639,7 +2676,7 @@ index 0000000..12c51ce
 +  for (uint64_t ctr : ctrs) {
 +    entry->window.Commit(ctr);
 +  }
-+  *kid_out = *frame_kid;
++  *kid_out = frame_kid;
 +  return true;
 +}
 +
@@ -2740,10 +2777,10 @@ index 0000000..12c51ce
 +}  // namespace webrtc
 diff --git a/api/crypto/sframe_transformer.h b/api/crypto/sframe_transformer.h
 new file mode 100644
-index 0000000..ebfd40e
+index 0000000..c90fa0d
 --- /dev/null
 +++ b/api/crypto/sframe_transformer.h
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,464 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the SFrame (RFC 9605) frame transformer
 + * of the native engine.
@@ -2765,8 +2802,9 @@ index 0000000..ebfd40e
 + *   - no default key, no implicit key fallback, no ratchet: a frame is opened
 + * only by the key of its own KID;
 + *   - leg binding (S-7): a receive stream bound to a leg opens only KIDs of
-+ * that leg, and with require_leg_binding an unbound one opens nothing — the
-+ * relay cannot route one member's frames under another participant's track;
++ * that leg, and an unbound one opens nothing (require_leg_binding is on by
++ * default and latched since tkm.10) — the relay cannot route one member's
++ * frames under another participant's track;
 + *   - nonce = salt XOR CTR with a CTR per KID that never repeats within this
 + * key store's life;
 + *   - zero-length frames dropped; codecs other than Opus / VP8 (H.264 only when
@@ -2981,9 +3019,13 @@ index 0000000..ebfd40e
 +  // S-7 (ruling Q1): when on, a receive stream opens frames ONLY after BindLeg
 +  // gave it a leg, and only under KIDs of that leg (kid >> 16): unbound →
 +  // drop kUnbound, another leg → drop kWrongLeg (both count toward the storm,
-+  // ruling Q3). Off (the default, for the pre-tkm.9 callers): an unbound
-+  // stream opens any installed KID, as before; a bound one is still filtered.
-+  // Call once at creation, before frames flow.
++  // ruling Q3). ON by default since tkm.10 (Iris §7.117 item 2, ruling R2:
++  // the binding never fails open) and a one-way latch: SetRequireLegBinding(
++  // false) is ignored once the flag is on — so, with the default, always —
++  // as the S-8 sentinel latch of the plugin. The setter stays for the
++  // bindings (passing true is a no-op). Independently of the flag, a stream
++  // that was EVER bound treats unbound as closed (BindLeg(nullopt) after a
++  // binding = the participant left the roster: kUnbound, never "any KID").
 +  void SetRequireLegBinding(bool required);
 +  bool require_leg_binding() const;
 +  // S-7: binds every receive stream labelled `stream_id` to `leg_index`
@@ -3024,6 +3066,10 @@ index 0000000..ebfd40e
 +
 + private:
 +  friend class SframeTransformer;
++  // sframe_transformer_unittest.cc: the only way to switch
++  // require_leg_binding_ off (the pre-S-7 tests drive unbound receivers; the
++  // ever_bound test needs the flag off to show the per-stream latch).
++  friend class SframeKeyStoreTestPeer;
 +
 +  struct KeyEntry {
 +    std::unique_ptr<sframe::SealingKey> key;
@@ -3043,6 +3089,9 @@ index 0000000..ebfd40e
 +    SframeTransformer* transformer = nullptr;  // delivers released frames
 +    std::deque<HeldFrame> held;                // C-24, receiver video only
 +    size_t held_bytes = 0;
++    // S-7 (tkm.10): BindLeg gave this stream a leg at least once. Once true,
++    // unbound = closed whatever require_leg_binding_ says.
++    bool ever_bound = false;
 +  };
 +  struct Delivery {
 +    scoped_refptr<TransformedFrameCallback> sink;
@@ -3063,8 +3112,15 @@ index 0000000..ebfd40e
 +  void PassLocked(Stream* stream, uint64_t kid, size_t out_bytes, Events* events)
 +      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 +  // S-7: nullopt when the stream may open `kid`, else kUnbound / kWrongLeg.
++  // The leg of `kid` is compared as the full uint64 (kid >> 16), not through
++  // the 32-bit LegIndexOf: a wire KID of 2^48 or more never aliases a leg.
 +  std::optional<SframeDropReason> LegCheckLocked(const Stream* stream,
 +                                                 uint64_t kid) const
++      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  // S-7: an unbound receive stream that opens nothing (the store requires
++  // the binding, or the stream was bound once): no key can resume it, only
++  // BindLeg.
++  bool ClosedUnboundLocked(const Stream* stream) const
 +      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 +  bool BindStreamLeg(Stream* stream, std::optional<uint32_t> leg_index);
 +  bool BindLegLocked(Stream* stream,
@@ -3087,13 +3143,20 @@ index 0000000..ebfd40e
 +                  const TransformableFrameInterface& frame,
 +                  std::vector<uint8_t>* out,
 +                  SframeDropReason* why) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  // `*kid_out` = the frame's KID as soon as its header was read, success or
++  // not.
 +  bool OpenLocked(Stream* stream,
 +                  const TransformableFrameInterface& frame,
 +                  std::vector<uint8_t>* out,
 +                  SframeDropReason* why,
-+                  uint64_t* kid_out) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-+  void DropLocked(Stream* stream, SframeDropReason why, Events* events)
++                  std::optional<uint64_t>* kid_out)
 +      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++  // `kid`: the dropped frame's KID (the send KID on the sender; nullopt when
++  // no header was read), carried by the kDropping / kStorm events.
++  void DropLocked(Stream* stream,
++                  SframeDropReason why,
++                  std::optional<uint64_t> kid,
++                  Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 +  void RecordNoSink(Stream* stream, size_t bytes, Events* events);
 +  static void SampleDrop(Stream* stream,
 +                         SframeDropReason why,
@@ -3117,7 +3180,9 @@ index 0000000..ebfd40e
 +  uint64_t install_seq_ RTC_GUARDED_BY(mutex_) = 0;
 +  int storm_threshold_ RTC_GUARDED_BY(mutex_) = kDefaultStormThreshold;
 +  bool h264_enabled_ RTC_GUARDED_BY(mutex_) = false;
-+  bool require_leg_binding_ RTC_GUARDED_BY(mutex_) = false;  // S-7
++  // S-7, on by default and latched on (tkm.10, R2); off only through the
++  // test peer.
++  bool require_leg_binding_ RTC_GUARDED_BY(mutex_) = true;
 +  TimeDelta hold_time_ RTC_GUARDED_BY(mutex_) = TimeDelta::Millis(kDefaultHoldMs);
 +  std::vector<std::unique_ptr<Stream>> streams_ RTC_GUARDED_BY(mutex_);
 +  Mutex observer_mutex_;
@@ -3182,10 +3247,10 @@ index 0000000..ebfd40e
 +#endif  // API_CRYPTO_SFRAME_TRANSFORMER_H_
 diff --git a/api/crypto/sframe_transformer_unittest.cc b/api/crypto/sframe_transformer_unittest.cc
 new file mode 100644
-index 0000000..2ac2e9a
+index 0000000..13c13b9
 --- /dev/null
 +++ b/api/crypto/sframe_transformer_unittest.cc
-@@ -0,0 +1,1242 @@
+@@ -0,0 +1,1497 @@
 +/*
 + * C182 / DR-055 — the SFrame transformer: our vectors through the
 + * FrameTransformerInterface, the fail-closed negative controls (CM-1, CM-2,
@@ -3220,6 +3285,19 @@ index 0000000..2ac2e9a
 +#include "test/gtest.h"
 +
 +namespace webrtc {
++
++// Test-only (a friend of SframeKeyStore): the one way to switch
++// require_leg_binding_ off, which tkm.10 latched on (Iris §7.117 item 2, R2).
++// The tests before S-7 drive unbound receivers, some under several legs; the
++// ever_bound test needs the flag off to show the per-stream latch.
++class SframeKeyStoreTestPeer {
++ public:
++  static void ForceRequireLegBinding(SframeKeyStore& store, bool required) {
++    MutexLock lock(&store.mutex_);
++    store.require_leg_binding_ = required;
++  }
++};
++
 +namespace {
 +
 +#include "api/crypto/sframe_test_vectors.inc"
@@ -3308,13 +3386,28 @@ index 0000000..2ac2e9a
 +    }
 +    return n;
 +  }
++  // The latest event of `t` on `stream`, or nullptr.
++  const SframeEvent* Last(SframeEvent::Type t, const std::string& stream) const {
++    for (auto it = events.rbegin(); it != events.rend(); ++it) {
++      if (it->type == t && it->stream_id == stream) {
++        return &*it;
++      }
++    }
++    return nullptr;
++  }
 +  std::vector<SframeEvent> events;
 +};
 +
 +// One leg of a call: a key store with the transformers of one track per
-+// direction and kind.
++// direction and kind. The S-7 binding requirement (on by default and latched
++// since tkm.10) is forced OFF unless `require_leg_binding`: the tests before
++// S-7 drive unbound receivers, some under several legs.
 +struct Leg {
-+  explicit Leg(Clock* clock = nullptr) : store(SframeKeyStore::Create(clock)) {
++  explicit Leg(Clock* clock = nullptr, bool require_leg_binding = false)
++      : store(SframeKeyStore::Create(clock)) {
++    if (!require_leg_binding) {
++      SframeKeyStoreTestPeer::ForceRequireLegBinding(*store, false);
++    }
 +    recorder = make_ref_counted<Recorder>();
 +    store->SetObserver(recorder);
 +  }
@@ -4293,8 +4386,9 @@ index 0000000..2ac2e9a
 +  rc->Transform(AudioFrame(from_carol, Direction::kReceiver));
 +  EXPECT_EQ(bob.sinks["recv:audio:carol"]->frames.size(), 1u);
 +  EXPECT_EQ(Dropped(rc->GetStats(), SframeDropReason::kReplay), 0u);
-+  // Without a binding and without require_leg_binding (the pre-tkm.9
-+  // behaviour) any installed KID opens: the filter is the binding.
++  // Without a binding and with require_leg_binding forced off by the fixture
++  // (tkm.10 requires it by default: RequireLegBindingIsOnByDefaultAndLatched)
++  // a never-bound stream opens any installed KID: the filter is the binding.
 +  auto rx = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "rx");
 +  sc->Transform(AudioFrame({0x78, 3}, Direction::kSender));
 +  rx->Transform(AudioFrame(carol.sinks["sc"]->frames.back(), Direction::kReceiver));
@@ -4424,6 +4518,232 @@ index 0000000..2ac2e9a
 +  EXPECT_STREQ(SframeDropReasonName(SframeDropReason::kWrongLeg), "wrong-leg");
 +  EXPECT_TRUE(SframeDropCountsForStorm(SframeDropReason::kUnbound));
 +  EXPECT_TRUE(SframeDropCountsForStorm(SframeDropReason::kWrongLeg));
++}
++
++// ---- S-7 hardening, tkm.10 (Iris §7.117 item 2 + native nits 8n1 / 8n3)
++// ----------------------------------------------------------------------------
++
++// R2: the binding is required by default, and the flag is a one-way latch —
++// SetRequireLegBinding(false) is ignored, whether the flag is on by default or
++// was set on explicitly. A store as the bindings create it opens nothing on
++// an unbound receiver until BindLeg.
++TEST(SframeTransformer, RequireLegBindingIsOnByDefaultAndLatched) {
++  auto raw = SframeKeyStore::Create();
++  EXPECT_TRUE(raw->require_leg_binding()) << "R2: on by default";
++  raw->SetRequireLegBinding(false);
++  EXPECT_TRUE(raw->require_leg_binding()) << "a one-way latch: false is ignored";
++  raw->SetRequireLegBinding(true);
++  EXPECT_TRUE(raw->require_leg_binding());
++  SframeKeyStoreTestPeer::ForceRequireLegBinding(*raw, false);
++  ASSERT_FALSE(raw->require_leg_binding());
++  raw->SetRequireLegBinding(true);  // the tkm.9 callers' explicit true
++  raw->SetRequireLegBinding(false);
++  EXPECT_TRUE(raw->require_leg_binding()) << "latched on again";
++
++  Leg alice, bob(nullptr, /*require_leg_binding=*/true);
++  ASSERT_EQ(alice.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
++  ASSERT_EQ(bob.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
++  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "ra");
++  sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
++  ra->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++  EXPECT_TRUE(bob.sinks["ra"]->frames.empty()) << "unbound by default = closed";
++  EXPECT_EQ(Dropped(ra->GetStats(), SframeDropReason::kUnbound), 1u);
++  ASSERT_TRUE(ra->BindLeg(sframe::LegIndexOf(kUnitsKid)));
++  sa->Transform(AudioFrame({0x78, 1, 3}, Direction::kSender));
++  ra->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++  EXPECT_EQ(bob.sinks["ra"]->frames.size(), 1u);
++}
++
++// The per-stream latch: a stream that was bound once treats a later unbind as
++// closed even with the store's flag off (defence in depth under the store
++// latch) — a participant who left the verified roster never falls back to
++// "any KID". It is per stream: a never-bound stream of the same store still
++// opens with the flag off. And no key resumes it once stormed: only BindLeg.
++TEST(SframeTransformer, EverBoundStreamStaysClosedOnceUnboundWhateverTheFlag) {
++  Leg alice, bob;  // the fixture forces the flag off
++  ASSERT_FALSE(bob.store->require_leg_binding());
++  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
++  ASSERT_EQ(alice.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kid(1, 4)));
++  ASSERT_EQ(bob.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
++  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "ra");
++  auto rx = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "rx");
++  auto next = [&] {
++    sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
++    return alice.sinks["sa"]->frames.back();
++  };
++  auto& got = bob.sinks["ra"]->frames;
++  ra->Transform(AudioFrame(next(), Direction::kReceiver));
++  EXPECT_EQ(got.size(), 1u) << "flag off, never bound: opens";
++  ASSERT_TRUE(ra->BindLeg(1));
++  ra->Transform(AudioFrame(next(), Direction::kReceiver));
++  EXPECT_EQ(got.size(), 2u);
++  ASSERT_TRUE(ra->BindLeg(std::nullopt));  // left the roster
++  for (int i = 0; i < SframeKeyStore::kDefaultStormThreshold; ++i) {
++    ra->Transform(AudioFrame(next(), Direction::kReceiver));
++  }
++  SframeStreamStats st = ra->GetStats();
++  EXPECT_EQ(got.size(), 2u) << "bound once: unbound = closed";
++  EXPECT_EQ(Dropped(st, SframeDropReason::kUnbound),
++            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold));
++  EXPECT_TRUE(st.storm);
++  rx->Transform(AudioFrame(next(), Direction::kReceiver));
++  EXPECT_EQ(bob.sinks["rx"]->frames.size(), 1u) << "per stream: a never-bound one still opens";
++  // rx opening kid(1, 4) — ra's last_kid — does not "recover" ra, and a new
++  // key resumes nothing here either (8n3): a closed stream cannot recover by
++  // a pass elsewhere or by a key, only by BindLeg.
++  EXPECT_TRUE(ra->GetStats().storm);
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kRecovered, "ra"), 0);
++  ASSERT_EQ(bob.store->SetKey(kid(1, 5), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  EXPECT_TRUE(ra->GetStats().storm);
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "ra"), 0);
++  ASSERT_TRUE(ra->BindLeg(1));
++  EXPECT_FALSE(ra->GetStats().storm);
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "ra"), 1);
++  ra->Transform(AudioFrame(next(), Direction::kReceiver));
++  EXPECT_EQ(got.size(), 3u);
++}
++
++// 8n1: a wire KID of 2^48 or more has a leg index wider than 16 bits, which no
++// key can carry; through the 32-bit LegIndexOf it aliased the bound leg
++// (2^48 + leg·2^16 → leg), passed the leg check, missed the key lookup as
++// unknown-kid and wrote itself into last_kid. Now it is wrong-leg before any
++// of that, and the drop event names it.
++TEST(SframeTransformer, WireKidBeyond48BitsIsWrongLegNotAnAliasOfTheBoundLeg) {
++  Leg bob(nullptr, /*require_leg_binding=*/true);
++  ASSERT_EQ(bob.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "ra");
++  ASSERT_TRUE(ra->BindLeg(1));
++  const uint64_t alias = (uint64_t{1} << 48) | kUnitsKid;
++  ASSERT_EQ(sframe::LegIndexOf(alias), 1u) << "the 32-bit view aliases leg 1";
++  ASSERT_FALSE(sframe::IsAssignableKid(alias));
++  std::vector<uint8_t> frame = {0x78};  // Opus TOC
++  const std::vector<uint8_t> header = sframe::EncodeHeader(alias, 0);
++  frame.insert(frame.end(), header.begin(), header.end());
++  frame.resize(frame.size() + 2 * sframe::kTagSize, 0x42);  // "ciphertext" + tag
++  ra->Transform(AudioFrame(frame, Direction::kReceiver));
++  const SframeStreamStats st = ra->GetStats();
++  EXPECT_EQ(Dropped(st, SframeDropReason::kWrongLeg), 1u);
++  EXPECT_EQ(Dropped(st, SframeDropReason::kUnknownKid), 0u);
++  EXPECT_FALSE(st.last_kid.has_value()) << "never this stream's history";
++  const SframeEvent* e = bob.recorder->Last(SframeEvent::Type::kDropping, "ra");
++  ASSERT_NE(e, nullptr);
++  EXPECT_EQ(e->reason, SframeDropReason::kWrongLeg);
++  EXPECT_EQ(e->kid, alias);
++  // the genuine KID still opens on the same stream afterwards
++  Leg alice;
++  ASSERT_EQ(alice.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
++  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
++  sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
++  ra->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++  EXPECT_EQ(bob.sinks["ra"]->frames.size(), 1u);
++}
++
++// 8n3: a key arriving resumes stormed receive streams (spec §9.2 [0.2]) — but
++// not an unbound stream that opens nothing: no key can recover it, only
++// BindLeg, and a resumed / storm pair per epoch would flap the app's
++// subscription toward the SFU. A bound stream stormed on a missing key still
++// resumes on that key.
++TEST(SframeTransformer, SetKeyLeavesAClosedUnboundStreamStormed) {
++  Leg alice, bob(nullptr, /*require_leg_binding=*/true);
++  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
++  ASSERT_EQ(bob.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_EQ(alice.store->SetKey(kid(1, 5), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kid(1, 5)));  // an epoch bob lacks
++  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
++  auto ru = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "ru");  // unbound
++  auto rb = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "rb");
++  ASSERT_TRUE(rb->BindLeg(1));
++  auto storm = [&] {
++    for (int i = 0; i < SframeKeyStore::kDefaultStormThreshold; ++i) {
++      sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
++      ru->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++      rb->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++    }
++  };
++  storm();
++  EXPECT_TRUE(ru->GetStats().storm);
++  EXPECT_TRUE(rb->GetStats().storm);
++  EXPECT_EQ(Dropped(ru->GetStats(), SframeDropReason::kUnbound),
++            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold));
++  EXPECT_EQ(Dropped(rb->GetStats(), SframeDropReason::kUnknownKid),
++            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold));
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kStorm, "ru"), 1);
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kStorm, "rb"), 1);
++
++  ASSERT_EQ(bob.store->SetKey(kid(1, 5), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  EXPECT_FALSE(rb->GetStats().storm) << "a bound stream resumes on the key";
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "rb"), 1);
++  EXPECT_TRUE(ru->GetStats().storm) << "an unbound one cannot recover by a key";
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "ru"), 0);
++  EXPECT_EQ(ru->GetStats().consecutive,
++            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold));
++  storm();  // still stormed, not a second storm (no flapping)
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kStorm, "ru"), 1);
++  EXPECT_EQ(bob.sinks["rb"]->frames.size(),
++            static_cast<size_t>(SframeKeyStore::kDefaultStormThreshold));
++
++  ASSERT_TRUE(ru->BindLeg(1));  // the one way back
++  EXPECT_FALSE(ru->GetStats().storm);
++  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "ru"), 1);
++  sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
++  ru->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++  EXPECT_EQ(bob.sinks["ru"]->frames.size(), 1u);
++}
++
++// 8n3: kDropping / kStorm carry the dropped frame's KID, not last_kid — which
++// an unbound or wrong-leg frame never writes (so it was absent or stale: the
++// last KID that DID pass the leg check).
++TEST(SframeTransformer, DropAndStormEventsCarryTheFramesKid) {
++  Leg alice, carol, bob(nullptr, /*require_leg_binding=*/true);
++  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
++  ASSERT_EQ(alice.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(alice.store->SetSendKid(kid(1, 4)));
++  ASSERT_EQ(carol.store->SetKey(kid(2, 4), OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_TRUE(carol.store->SetSendKid(kid(2, 4)));
++  ASSERT_EQ(bob.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
++  ASSERT_EQ(bob.store->SetKey(kid(2, 4), OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
++  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
++  auto sc = carol.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sc");
++  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "ra");
++
++  sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
++  ra->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++  const SframeEvent* e = bob.recorder->Last(SframeEvent::Type::kDropping, "ra");
++  ASSERT_NE(e, nullptr);
++  EXPECT_EQ(e->reason, SframeDropReason::kUnbound);
++  EXPECT_EQ(e->kid, kid(1, 4)) << "the unbound frame's KID (last_kid is unset)";
++  EXPECT_FALSE(ra->GetStats().last_kid.has_value());
++
++  ASSERT_TRUE(ra->BindLeg(1));
++  ra->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
++  EXPECT_EQ(ra->GetStats().last_kid, kid(1, 4));
++  for (int i = 0; i < SframeKeyStore::kDefaultStormThreshold; ++i) {
++    sc->Transform(AudioFrame({0x78, 2, 2}, Direction::kSender));
++    ra->Transform(AudioFrame(carol.sinks["sc"]->frames.back(), Direction::kReceiver));  // re-routed
++  }
++  e = bob.recorder->Last(SframeEvent::Type::kDropping, "ra");
++  ASSERT_NE(e, nullptr);
++  EXPECT_EQ(e->reason, SframeDropReason::kWrongLeg);
++  EXPECT_EQ(e->kid, kid(2, 4)) << "the re-routed frame's KID, not last_kid = kid(1, 4)";
++  e = bob.recorder->Last(SframeEvent::Type::kStorm, "ra");
++  ASSERT_NE(e, nullptr);
++  EXPECT_EQ(e->reason, SframeDropReason::kWrongLeg);
++  EXPECT_EQ(e->kid, kid(2, 4));
++  EXPECT_EQ(e->consecutive, static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold));
++  EXPECT_EQ(ra->GetStats().last_kid, kid(1, 4)) << "wrong-leg never wrote it";
++
++  // sender side: the send KID (nullopt when there is none)
++  auto sx = bob.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sx");
++  sx->Transform(AudioFrame({0x78, 1}, Direction::kSender));
++  e = bob.recorder->Last(SframeEvent::Type::kDropping, "sx");
++  ASSERT_NE(e, nullptr);
++  EXPECT_EQ(e->reason, SframeDropReason::kNoKey);
++  EXPECT_FALSE(e->kid.has_value());
 +}
 +
 +}  // namespace
@@ -4917,10 +5237,10 @@ index 0000000..dbc0c42
 +}
 diff --git a/sdk/android/api/org/webrtc/SFrameKeyStore.java b/sdk/android/api/org/webrtc/SFrameKeyStore.java
 new file mode 100644
-index 0000000..5b23a3e
+index 0000000..f308ac4
 --- /dev/null
 +++ b/sdk/android/api/org/webrtc/SFrameKeyStore.java
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,186 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055).
 + *
@@ -5028,8 +5348,11 @@ index 0000000..5b23a3e
 +
 +  /**
 +   * S-7 (ruling Q1): when on, a receive stream opens frames only after {@link #bindLeg} gave it a leg, and only under
-+   * KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). Off by
-+   * default (the pre-tkm.9 behaviour). Set once, at creation, before frames flow.
++   * KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). ON by
++   * default since tkm.10 (Iris §7.117 item 2, ruling R2) and a one-way latch: {@code setRequireLegBinding(false)} is
++   * ignored once the flag is on — so, with the default, always; passing {@code true} is a no-op kept for the callers
++   * of tkm.9. Independently of the flag, a stream that was ever bound treats a later unbind as closed ("unbound"),
++   * never as "open any KID".
 +   */
 +  public void setRequireLegBinding(boolean required) {
 +    checkExists();
@@ -6047,10 +6370,10 @@ index 0000000..0effb40
 +NS_ASSUME_NONNULL_END
 diff --git a/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h
 new file mode 100644
-index 0000000..7b376d3
+index 0000000..5183d88
 --- /dev/null
 +++ b/sdk/objc/api/peerconnection/RTCSFrameKeyStore.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,129 @@
 +/*
 + * Takamaka E2EE calls (C182 / DR-055) — the iOS/macOS API of the RFC 9605
 + * SFrame transformer (api/crypto/sframe_transformer.h). Twin of the Android
@@ -6143,8 +6466,10 @@ index 0000000..7b376d3
 +
 +/**
 + * S-7 (ruling Q1): when YES, a receive stream opens frames only after -bindLeg:streamId: gave it a leg, and only
-+ * under KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). NO by
-+ * default (the pre-tkm.9 behaviour). Set once, at creation, before frames flow.
++ * under KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). YES by
++ * default since tkm.10 (Iris §7.117 item 2, ruling R2) and a one-way latch: `setRequireLegBinding:NO` is ignored once
++ * the flag is on — so, with the default, always; `YES` is a no-op kept for the callers of tkm.9. Independently of the
++ * flag, a stream that was ever bound treats a later unbind as closed ("unbound"), never as "open any KID".
 + */
 +- (void)setRequireLegBinding:(BOOL)required;
 +

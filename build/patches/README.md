@@ -242,3 +242,13 @@ The iOS-only xcframework is built by `.github/workflows/tkm-ios.yml` from `TKM_W
 (= the Android AAR's base, webrtc-sdk/webrtc `67c45788`). Relative to tkm.4 the patch adds ONLY those Objective-C files:
 `api/crypto/` and `sdk/android/` are byte-identical, so the Android AAR `150.7871.03-tkm.4` and the iOS framework carry
 the same transformer.
+
+### tkm.10 — S-7 hardening (Iris §7.117 item 2 + native nits, 2026-10-30)
+
+Fork branch `fix/iris-7117-native` on top of `dce2daf` (tkm.9). `SframeKeyStore::require_leg_binding_` is now ON by
+default and a one-way latch (`SetRequireLegBinding(false)` is ignored — ruling R2: the leg binding never fails open); a
+receive stream that was ever bound treats a later unbind as `unbound`; the leg check compares the full 64-bit leg
+(`kid >> 16`), so a wire KID ≥ 2^48 is `wrong-leg`, never an alias of the bound leg; `SetKey` no longer resumes an unbound
+stream that opens nothing (no `resumed`/`storm` pair per epoch); drop and storm events carry the dropped frame's KID.
+Five new gtests in `sframe_unittests`. Android AAR `150.7871.03-tkm.10` and the iOS xcframework (`TKM_IOS_VERSION`
+tkm.10, tag `ios-c182-sframe.3`) are built from this same patch on the same base `67c45788`.
