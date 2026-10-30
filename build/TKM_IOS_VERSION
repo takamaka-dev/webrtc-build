@@ -3,5 +3,5 @@
 # base webrtc-sdk/webrtc m150_release 67c45788 = the AAR 150.7871.03-tkm.4): both platforms run the same libwebrtc
 # plus the same tkm_sframe.patch. Bump TKM_IOS_RELEASE_TAG to publish a new pre-release from a branch push.
 TKM_WEBRTC_COMMIT=67c45788424e3ec9df1ebc53e0269d9d5f09295b
-TKM_IOS_VERSION=150.7871.03-tkm.9
-TKM_IOS_RELEASE_TAG=ios-c182-sframe.2
+TKM_IOS_VERSION=150.7871.03-tkm.10
+TKM_IOS_RELEASE_TAG=ios-c182-sframe.3
